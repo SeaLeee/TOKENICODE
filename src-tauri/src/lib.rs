@@ -2520,7 +2520,7 @@ async fn start_claude_session(
             "type": "user",
             "message": {
                 "role": "user",
-                "content": params.prompt
+                "content": build_turn_content(&params.prompt, params.image_paths.as_ref())
             }
         });
         stdin_mgr.send(&sid, &first_msg.to_string()).await?;
@@ -2534,21 +2534,172 @@ async fn start_claude_session(
     })
 }
 
+/// Media type for an image path, or `None` when the extension is not one of the
+/// image formats Claude accepts as a content block.
+fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Build the stream-json `content` for a user turn.
+///
+/// Without images this is the plain message string. With images it becomes an
+/// array of `image` blocks followed by a `text` block, which is the shape the
+/// Claude CLI accepts on stdin. Unreadable or non-image paths are skipped so a
+/// bad attachment degrades to a text-only turn instead of failing the whole turn.
+fn build_turn_content(text: &str, image_paths: Option<&Vec<String>>) -> Value {
+    use base64::Engine as _;
+
+    let mut blocks: Vec<Value> = vec![];
+    if let Some(paths) = image_paths {
+        for raw in paths {
+            let path = std::path::Path::new(raw);
+            let Some(media_type) = image_media_type(path) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            blocks.push(serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                }
+            }));
+        }
+    }
+
+    if blocks.is_empty() {
+        return Value::String(text.to_string());
+    }
+    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+    Value::Array(blocks)
+}
+
 #[tauri::command]
 async fn send_stdin(
     stdin_mgr: State<'_, StdinManager>,
     session_id: String,
     message: String,
+    image_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
-    // Wrap user text in stream-json NDJSON format
+    // Wrap user text in stream-json NDJSON format. Images attached to this turn
+    // ride along as image content blocks.
     let json_msg = serde_json::json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": message
+            "content": build_turn_content(&message, image_paths.as_ref())
         }
     });
     stdin_mgr.send(&session_id, &json_msg.to_string()).await
+}
+
+#[cfg(test)]
+mod turn_content_tests {
+    use super::{build_turn_content, image_media_type};
+    use base64::Engine as _;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    fn write_temp_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_media_type_known_extensions() {
+        assert_eq!(
+            image_media_type(std::path::Path::new("a.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_media_type(std::path::Path::new("a.JPG")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_media_type(std::path::Path::new("a.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_media_type(std::path::Path::new("a.gif")),
+            Some("image/gif")
+        );
+        assert_eq!(
+            image_media_type(std::path::Path::new("a.webp")),
+            Some("image/webp")
+        );
+    }
+
+    #[test]
+    fn test_media_type_rejects_non_images() {
+        assert_eq!(image_media_type(std::path::Path::new("a.pdf")), None);
+        assert_eq!(image_media_type(std::path::Path::new("a.txt")), None);
+        assert_eq!(image_media_type(std::path::Path::new("noext")), None);
+    }
+
+    #[test]
+    fn test_content_is_plain_string_without_images() {
+        assert_eq!(
+            build_turn_content("hello", None),
+            Value::String("hello".to_string())
+        );
+
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            build_turn_content("hello", Some(&none)),
+            Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_content_encodes_image_block_then_text() {
+        let dir = TempDir::new().unwrap();
+        let raw = b"\x89PNG-not-a-real-png";
+        let paths = vec![write_temp_file(dir.path(), "shot.png", raw)];
+
+        let content = build_turn_content("look at this", Some(&paths));
+        let blocks = content.as_array().expect("images should produce blocks");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(
+            blocks[0]["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        // Text trails the images so the model sees them before the instruction.
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "look at this");
+    }
+
+    #[test]
+    fn test_unreadable_and_non_image_paths_degrade_to_text() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nope.png").to_string_lossy().to_string();
+        let not_an_image = write_temp_file(dir.path(), "notes.txt", b"hi");
+
+        let paths = vec![missing, not_an_image];
+        assert_eq!(
+            build_turn_content("hello", Some(&paths)),
+            Value::String("hello".to_string())
+        );
+    }
 }
 
 #[tauri::command]
@@ -4765,9 +4916,12 @@ fn update_frontmatter_field(content: &str, field: &str, value: Option<&str>) -> 
     content.to_string()
 }
 
-/// Scan and return all available skills (global + project)
+/// Scan and return all available skills (global + project + custom)
 #[tauri::command]
-async fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
+async fn list_skills(
+    cwd: Option<String>,
+    extra_skill_dirs: Option<Vec<String>>,
+) -> Result<Vec<SkillInfo>, String> {
     let mut skills: Vec<SkillInfo> = vec![];
 
     // Helper: scan a skills directory for */SKILL.md
@@ -4834,6 +4988,11 @@ async fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
             .join(".claude")
             .join("skills");
         skills.extend(scan_skills_dir(&project_dir, "project"));
+    }
+
+    // Custom skills: user-configured extra directories
+    for dir in extra_skill_dirs.unwrap_or_default() {
+        skills.extend(scan_skills_dir(std::path::Path::new(&dir), "custom"));
     }
 
     Ok(skills)
@@ -4912,7 +5071,10 @@ async fn delete_skill(
 
 /// Unified endpoint that returns all commands and skills in a single call
 #[tauri::command]
-async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, String> {
+async fn list_all_commands(
+    cwd: Option<String>,
+    extra_skill_dirs: Option<Vec<String>>,
+) -> Result<Vec<UnifiedCommand>, String> {
     let mut commands: Vec<UnifiedCommand> = vec![];
 
     // 1. Built-in commands: (name, description, has_args, execution)
@@ -5120,6 +5282,11 @@ async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, S
             .join(".claude")
             .join("skills");
         commands.extend(scan_skills_dir(&project_dir, "project"));
+    }
+
+    // 6. Custom skills: user-configured extra directories
+    for dir in extra_skill_dirs.unwrap_or_default() {
+        commands.extend(scan_skills_dir(std::path::Path::new(&dir), "custom"));
     }
 
     Ok(commands)
