@@ -8447,7 +8447,8 @@ struct SkillHubSkill {
     description: String,
     description_zh: Option<String>,
     #[serde(rename = "iconUrl")]
-    icon_url: String,
+    /// Null for a sizeable share of the catalogue (14 of 50 in one sample).
+    icon_url: Option<String>,
     score: f64,
     downloads: u64,
     installs: u64,
@@ -8455,8 +8456,16 @@ struct SkillHubSkill {
     category: String,
     source: String,
     labels: Option<Value>,
-    publisher: SkillHubPublisher,
+    publisher: Option<SkillHubPublisher>,
     verified: bool,
+}
+
+/// The list endpoint wraps its payload: `{code, data:{skills,total}, message}`.
+/// Deserializing `SkillHubSearchResult` straight off the response never matched,
+/// so search failed before it could return anything.
+#[derive(Debug, Deserialize)]
+struct SkillHubSearchEnvelope {
+    data: SkillHubSearchResult,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8483,50 +8492,97 @@ struct SkillHubSearchParams {
     sort_by: Option<String>,
 }
 
+/// SkillHub API mirrors, tried in order.
+///
+/// The marketplace used to point at `https://skillhub.qq.com`, which is now
+/// NXDOMAIN — the host was retired upstream and took the whole marketplace down
+/// with it. Listing mirrors here means the next move degrades instead of
+/// breaking, since the fallback is only reached when the first host fails.
+const SKILLHUB_HOSTS: [&str; 2] = [
+    "https://api.skillhub.cn",
+    "https://api.skillhub.tencent.com",
+];
+
 #[tauri::command]
 async fn search_skillhub(params: SkillHubSearchParams) -> Result<SkillHubSearchResult, String> {
     let client = reqwest::Client::new();
-    let mut req = client.get("https://skillhub.qq.com/api/v1/skills").query(&[
-        ("page", params.page.unwrap_or(1).to_string()),
-        ("pageSize", params.page_size.unwrap_or(20).to_string()),
-    ]);
-    if let Some(ref kw) = params.keyword {
-        if !kw.is_empty() {
-            req = req.query(&[("keyword", kw)]);
+    let mut last_err = "no SkillHub host configured".to_string();
+
+    for host in SKILLHUB_HOSTS {
+        // Search lives at `/api/skills` — the `/api/v1/skills` path answers 405.
+        let mut req = client
+            .get(format!("{}/api/skills", host))
+            .query(&[
+                ("page", params.page.unwrap_or(1).to_string()),
+                ("pageSize", params.page_size.unwrap_or(20).to_string()),
+            ]);
+        if let Some(ref kw) = params.keyword {
+            if !kw.is_empty() {
+                req = req.query(&[("keyword", kw)]);
+            }
         }
-    }
-    if let Some(ref sort) = params.sort_by {
-        if !sort.is_empty() {
-            req = req.query(&[("sortBy", sort)]);
+        if let Some(ref sort) = params.sort_by {
+            if !sort.is_empty() {
+                req = req.query(&[("sortBy", sort)]);
+            }
+        }
+
+        match req.send().await {
+            Ok(resp) => match resp.json::<SkillHubSearchEnvelope>().await {
+                Ok(envelope) => return Ok(envelope.data),
+                Err(e) => last_err = format!("{}: {}", host, e),
+            },
+            Err(e) => last_err = format!("{}: {}", host, e),
         }
     }
 
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let result: SkillHubSearchResult = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(result)
+    Err(last_err)
 }
 
 #[tauri::command]
 async fn install_skill(slug: String, namespace: Option<String>) -> Result<InstallSkillResult, String> {
-    let _ = namespace;
     let Some(home) = dirs::home_dir() else {
         return Err("Home directory not found".to_string());
     };
+
+    let client = reqwest::Client::new();
+    let mut last_err = "no SkillHub host configured".to_string();
+    let mut archive_bytes: Option<Vec<u8>> = None;
+
+    for host in SKILLHUB_HOSTS {
+        // Download lives under `/api/v1` (unlike search) and streams a zip.
+        let mut req = client
+            .get(format!("{}/api/v1/download", host))
+            .query(&[("slug", slug.as_str())]);
+        if let Some(ref ns) = namespace {
+            if !ns.is_empty() {
+                req = req.query(&[("namespace", ns.as_str())]);
+            }
+        }
+
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) => {
+                    archive_bytes = Some(bytes.to_vec());
+                    break;
+                }
+                Err(e) => last_err = format!("{}: {}", host, e),
+            },
+            Ok(resp) => last_err = format!("{}: HTTP {}", host, resp.status()),
+            Err(e) => last_err = format!("{}: {}", host, e),
+        }
+    }
+
+    let Some(archive_bytes) = archive_bytes else {
+        return Err(last_err);
+    };
+
+    // Created only once the archive is in hand, so a failed download no longer
+    // leaves an empty `~/.claude/skills/<slug>/` behind.
     let target_dir = home.join(".claude").join("skills").join(&slug);
     std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-    let download_url = format!("https://skillhub.qq.com/api/v1/skills/{}/download", slug);
-    let client = reqwest::Client::new();
-    let bytes = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let reader = std::io::Cursor::new(bytes);
+    let reader = std::io::Cursor::new(archive_bytes);
     let mut archive =
         zip::ZipArchive::new(reader).map_err(|e| format!("Invalid zip archive: {}", e))?;
 

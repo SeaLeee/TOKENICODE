@@ -124,7 +124,8 @@ export interface SkillHubSkill {
   description: string;
   /** Chinese description; the Rust struct keeps the snake_case key via explicit rename. */
   description_zh?: string;
-  iconUrl: string;
+  /** Null for a sizeable share of the catalogue — render a fallback. */
+  iconUrl: string | null;
   score: number;
   downloads: number;
   installs: number;
@@ -133,7 +134,8 @@ export interface SkillHubSkill {
   source: string;
   /** Opaque: the API returns an object ({"requires_api_key":"false"}), not an array. */
   labels?: unknown;
-  publisher: SkillHubPublisher;
+  /** Absent on many skills — the API only publishes it for some sources. */
+  publisher?: SkillHubPublisher;
   verified: boolean;
 }
 
