@@ -29,6 +29,8 @@ import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { FileIcon } from '../shared/FileIcon';
 import { tokenicodeTheme, tokenicodeHighlight } from '../../lib/codemirror-theme';
 import { useT } from '../../lib/i18n';
+import { isStoryboardMarkdown } from '../../lib/storyboard';
+import { StoryboardEditor } from './StoryboardEditor';
 
 /* ================================================================
    Helpers
@@ -146,6 +148,7 @@ export function FilePreview() {
   const isBinary = BINARY_EXTS.has(ext);
   const hasPreview = isMarkdown || isHtml || isSvg;
   const isEditing = previewMode === 'edit';
+  const isStoryboard = isMarkdown && fileContent !== null && isStoryboardMarkdown(fileContent);
   const isDirty = editContent !== null && editContent !== fileContent;
 
   const lineCount = useMemo(() => {
@@ -167,9 +170,9 @@ export function FilePreview() {
   /* Mode tabs for the header */
   const modeTabs = useMemo(() => {
     if (isMarkdown) {
-      // Markdown — preview + edit only
       return [
         { id: 'preview' as const, label: t('files.preview') },
+        ...(isStoryboard ? [{ id: 'storyboard' as const, label: t('storyboard.mode') }] : []),
         { id: 'edit' as const, label: t('files.edit') },
       ];
     }
@@ -188,7 +191,7 @@ export function FilePreview() {
       ];
     }
     return [];
-  }, [hasPreview, isMarkdown, isBinary, isImage, t]);
+  }, [hasPreview, isMarkdown, isStoryboard, isBinary, isImage, isPdf, isVideo, isAudio, t]);
 
   if (!selectedFile) return null;
 
@@ -211,7 +214,7 @@ export function FilePreview() {
 
         <div className="flex items-center gap-1.5 flex-shrink-0">
           {/* Save / Discard buttons — visible when editing with unsaved changes */}
-          {isEditing && isDirty && (
+          {(isEditing || previewMode === 'storyboard') && isDirty && (
             <div className="flex items-center gap-1 animate-fade-in">
               <button
                 onClick={discardEdits}
@@ -252,6 +255,32 @@ export function FilePreview() {
               ))}
             </div>
           )}
+
+          {/* Open file in editor (VS Code) */}
+          <button
+            onClick={() => selectedFile && bridge.openInVscode(selectedFile)}
+            className="p-2 rounded-lg hover:bg-bg-tertiary
+              text-text-tertiary hover:text-text-primary transition-smooth cursor-pointer"
+            title={t('files.openFile')}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 2h5v5M14 2L8 8M6 2H3.5A1.5 1.5 0 002 3.5v9A1.5 1.5 0 003.5 14h9a1.5 1.5 0 001.5-1.5V10" />
+            </svg>
+          </button>
+
+          {/* Open containing folder */}
+          <button
+            onClick={() => selectedFile && bridge.revealInFinder(selectedFile)}
+            className="p-2 rounded-lg hover:bg-bg-tertiary
+              text-text-tertiary hover:text-text-primary transition-smooth cursor-pointer"
+            title={t('files.openFolder')}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M1.5 3.5A1 1 0 012.5 2.5h3l1.5 2h6a1 1 0 011 1v7a1 1 0 01-1 1h-11a1 1 0 01-1-1v-9z" />
+            </svg>
+          </button>
 
           {/* Refresh button */}
           <button
@@ -364,6 +393,12 @@ export function FilePreview() {
               )}
             </div>
           </div>
+        ) : previewMode === 'storyboard' && isStoryboard && selectedFile && editContent !== null ? (
+          <StoryboardEditor
+            filePath={selectedFile}
+            content={editContent}
+            onChange={setEditContent}
+          />
         ) : isEditing ? (
           /* Edit mode: CodeMirror 6 editor */
           <CodeMirror

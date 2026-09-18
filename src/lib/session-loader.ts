@@ -16,6 +16,19 @@ export interface LoadedSession {
   messages: ChatMessage[];
   agents: AgentData[];
   mainAgentStartTime: number;
+  /** Full context size (input + cache read + cache create) from the last usage
+   *  object in the session — populates the context meter on resume so it isn't
+   *  stuck at 0% until the next streamed turn. */
+  lastContextTokens: number;
+}
+
+/** Full context size from a Claude usage object (raw `input_tokens` only counts
+ *  non-cached tokens; the cached bulk lives in `cache_read_input_tokens`). */
+function usageContextTokens(usage: any): number {
+  if (!usage || typeof usage !== 'object') return 0;
+  return (usage.input_tokens ?? 0)
+    + (usage.cache_read_input_tokens ?? 0)
+    + (usage.cache_creation_input_tokens ?? 0);
 }
 
 /** Detect system-injected content that should not be shown to users */
@@ -54,6 +67,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
 
   // Collect tool_use_id → index mapping for binding tool results
   const toolUseIdToIndex = new Map<string, number>();
+  let lastContextTokens = 0;
 
   const extractToolResultText = (payload: any): string => {
     if (typeof payload === 'string') return payload;
@@ -86,6 +100,12 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
   };
 
   for (const msg of rawMessages) {
+    // Track the latest full-context size from any usage object (assistant
+    // messages carry `message.usage`; some shapes carry top-level `usage`).
+    const usage = msg?.message?.usage ?? msg?.usage;
+    const ctx = usageContextTokens(usage);
+    if (ctx > 0) lastContextTokens = ctx;
+
     // Skip system-injected meta messages
     if (msg.isMeta) continue;
 
@@ -263,5 +283,5 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     }
   }
 
-  return { messages, agents, mainAgentStartTime: sessionStartTime };
+  return { messages, agents, mainAgentStartTime: sessionStartTime, lastContextTokens };
 }

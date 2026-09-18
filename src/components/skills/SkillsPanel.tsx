@@ -1,12 +1,19 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useSkillStore } from '../../stores/skillStore';
+import { useSkillMetaStore } from '../../stores/skillMetaStore';
+import { SkillMarketplace } from './SkillMarketplace';
 import { useFileStore } from '../../stores/fileStore';
 import { useCommandStore } from '../../stores/commandStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
+import { showToast } from '../shared/Toast';
+import { inferSkillCategory, CATEGORY_ORDER } from '../../lib/skill-category';
 import type { SkillInfo } from '../../lib/tauri-bridge';
+
+/** SkillInfo.name carries no leading slash — it *is* the slug used by skillMetaStore. */
+const slugOf = (skill: SkillInfo) => skill.name;
 
 export function SkillsPanel() {
   const t = useT();
@@ -16,11 +23,24 @@ export function SkillsPanel() {
   const deleteSkill = useSkillStore((s) => s.deleteSkill);
   const toggleEnabled = useSkillStore((s) => s.toggleEnabled);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
+  const customSkillDirs = useSettingsStore((s) => s.customSkillDirs);
+  const addCustomSkillDir = useSettingsStore((s) => s.addCustomSkillDir);
+  const removeCustomSkillDir = useSettingsStore((s) => s.removeCustomSkillDir);
   const selectFile = useFileStore((s) => s.selectFile);
   const selectedFile = useFileStore((s) => s.selectedFile);
+  const tags = useSkillMetaStore((s) => s.tags);
+  const favorites = useSkillMetaStore((s) => s.favorites);
+  const ratings = useSkillMetaStore((s) => s.ratings);
+  const toggleFavorite = useSkillMetaStore((s) => s.toggleFavorite);
+  const setRating = useSkillMetaStore((s) => s.setRating);
+  const setTags = useSkillMetaStore((s) => s.setTags);
 
   const [searchQuery, setSearchQuery] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
+  const [view, setView] = useState<'installed' | 'marketplace'>('installed');
+
+  // Larger detail panel opened by clicking a skill card
+  const [detailSkill, setDetailSkill] = useState<SkillInfo | null>(null);
 
   // Context menu (triggered by "..." button)
   const [contextMenu, setContextMenu] = useState<{
@@ -65,13 +85,73 @@ export function SkillsPanel() {
   const sortByName = (a: SkillInfo, b: SkillInfo) =>
     a.name.localeCompare(b.name, 'zh-Hans-CN');
 
-  // Group skills by scope
-  const globalSkills = filteredSkills.filter((s) => s.scope === 'global').sort(sortByName);
-  const projectSkills = filteredSkills.filter((s) => s.scope === 'project').sort(sortByName);
+  // Custom-folder skills float to a dedicated "我的技能" group at the very top.
+  const customSkills = filteredSkills
+    .filter((s) => s.scope === 'custom')
+    .sort(sortByName);
+
+  // A skill is "starred" if the user favorited it, or rated it >= 4 — these
+  // surface in a dedicated group ahead of the category-sorted rest.
+  const isStarred = (s: SkillInfo) =>
+    Boolean(favorites[slugOf(s)]) || (ratings[slugOf(s)] ?? 0) >= 4;
+
+  const starredSkills = filteredSkills
+    .filter((s) => s.scope !== 'custom' && isStarred(s))
+    .sort((a, b) => {
+      const rb = ratings[slugOf(b)] ?? 0;
+      const ra = ratings[slugOf(a)] ?? 0;
+      if (rb !== ra) return rb - ra;
+      const fb = favorites[slugOf(b)] ? 1 : 0;
+      const fa = favorites[slugOf(a)] ? 1 : 0;
+      if (fb !== fa) return fb - fa;
+      return sortByName(a, b);
+    });
+
+  // Remaining skills grouped by inferred functional category (name + description
+  // + tags), so e.g. storyboard / 分镜 skills land in 影视 rather than 其他.
+  const byCategory = new Map<string, SkillInfo[]>();
+  for (const s of filteredSkills) {
+    if (s.scope === 'custom' || isStarred(s)) continue;
+    const cat = inferSkillCategory(slugOf(s), s.description, tags[slugOf(s)]);
+    const arr = byCategory.get(cat);
+    if (arr) arr.push(s);
+    else byCategory.set(cat, [s]);
+  }
+  const categoryGroups = CATEGORY_ORDER
+    .filter((id) => byCategory.has(id))
+    .map((id) => ({
+      label: t(`skillCategory.${id}`),
+      skills: [...byCategory.get(id)!].sort(sortByName),
+    }));
+
+  const handleAddFolder = useCallback(async () => {
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const picked = await open({ directory: true, multiple: false, title: t('skills.addFolder') });
+    if (typeof picked === 'string') {
+      addCustomSkillDir(picked);
+      try {
+        const imported = await bridge.importCustomSkills(picked);
+        if (imported.length > 0) {
+          showToast(t('skills.importSuccess').replace('{names}', imported.join(', ')), 'success');
+        }
+      } catch (err) {
+        console.error('Failed to import custom skills:', err);
+        showToast(t('skills.importFailed') + ': ' + String(err), 'error');
+      }
+      await fetchSkills(workingDirectory || undefined);
+      await useCommandStore.getState().fetchCommands(workingDirectory || undefined);
+    }
+  }, [t, addCustomSkillDir, fetchSkills, workingDirectory]);
+
+  const handleRemoveFolder = useCallback(async (dir: string) => {
+    removeCustomSkillDir(dir);
+    await fetchSkills(workingDirectory || undefined);
+    await useCommandStore.getState().fetchCommands(workingDirectory || undefined);
+  }, [removeCustomSkillDir, fetchSkills, workingDirectory]);
 
   const handleSelect = useCallback((skill: SkillInfo) => {
-    selectFile(skill.path);
-  }, [selectFile]);
+    setDetailSkill(skill);
+  }, []);
 
   const handleOpenMenu = useCallback((e: React.MouseEvent, skill: SkillInfo) => {
     e.preventDefault();
@@ -94,7 +174,7 @@ export function SkillsPanel() {
 
   const handleUseInInput = useCallback((skill: SkillInfo) => {
     setContextMenu(null);
-    useCommandStore.getState().setActivePrefix({
+    useCommandStore.getState().addPrefix({
       name: `/${skill.name}`,
       description: skill.description,
       source: skill.scope,
@@ -107,6 +187,7 @@ export function SkillsPanel() {
 
   const handleEdit = useCallback((skill: SkillInfo) => {
     setContextMenu(null);
+    setDetailSkill(null);
     selectFile(skill.path);
   }, [selectFile]);
 
@@ -133,9 +214,10 @@ export function SkillsPanel() {
   const handleDelete = useCallback(async (skill: SkillInfo) => {
     setContextMenu(null);
     if (confirm(t('skills.confirmDelete'))) {
+      if (detailSkill?.path === skill.path) setDetailSkill(null);
       await deleteSkill(skill);
     }
-  }, [deleteSkill, t]);
+  }, [deleteSkill, t, detailSkill]);
 
   // Skill count
   const totalCount = filteredSkills.length;
@@ -171,8 +253,86 @@ export function SkillsPanel() {
         </button>
       </div>
 
-      {/* Search bar — borderless, hover 较深底色 */}
-      <div className="px-2 py-1.5">
+      {/* View switcher: installed / marketplace */}
+      <div className="flex mx-2 mb-1 p-0.5 rounded-lg bg-bg-secondary/60">
+        <button
+          onClick={() => setView('installed')}
+          className={`flex-1 py-1 rounded-md text-xs transition-smooth ${
+            view === 'installed'
+              ? 'bg-bg-card text-text-primary shadow-sm'
+              : 'text-text-tertiary hover:text-text-primary'
+          }`}
+        >
+          {t('skills.installed')}
+        </button>
+        <button
+          onClick={() => setView('marketplace')}
+          className={`flex-1 py-1 rounded-md text-xs transition-smooth ${
+            view === 'marketplace'
+              ? 'bg-bg-card text-text-primary shadow-sm'
+              : 'text-text-tertiary hover:text-text-primary'
+          }`}
+        >
+          {t('skills.marketplace')}
+        </button>
+      </div>
+
+      {view === 'installed' ? (
+        <>
+          {/* Custom skill folders — add / list / remove */}
+          <div className="px-2 pt-1 pb-0.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-text-tertiary font-medium">
+                {t('skills.customFolders')}
+              </span>
+              <button
+                onClick={handleAddFolder}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px]
+                  text-text-tertiary hover:text-text-primary hover:bg-bg-secondary transition-smooth"
+                title={t('skills.addFolderHint')}
+              >
+                <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <path d="M8 3v10M3 8h10" />
+                </svg>
+                {t('skills.addFolder')}
+              </button>
+            </div>
+            {customSkillDirs.length > 0 && (
+              <div className="mt-1 space-y-0.5">
+                {customSkillDirs.map((dir) => (
+                  <div
+                    key={dir}
+                    className="flex items-center gap-1.5 px-1.5 py-1 rounded-md
+                      bg-bg-secondary/50 group/dir"
+                  >
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none"
+                      stroke="currentColor" strokeWidth="1.5"
+                      className="text-amber-500 flex-shrink-0">
+                      <path d="M2 4h4l1.5 2H14v7a1 1 0 01-1 1H3a1 1 0 01-1-1V4z" />
+                    </svg>
+                    <span className="flex-1 min-w-0 text-[10px] text-text-tertiary truncate" title={dir}>
+                      {dir}
+                    </span>
+                    <button
+                      onClick={() => handleRemoveFolder(dir)}
+                      className="flex-shrink-0 p-0.5 rounded text-text-tertiary
+                        opacity-0 group-hover/dir:opacity-100 hover:text-error transition-smooth"
+                      title={t('skills.removeFolder')}
+                    >
+                      <svg width="9" height="9" viewBox="0 0 10 10" fill="none"
+                        stroke="currentColor" strokeWidth="1.5">
+                        <path d="M2 2l6 6M8 2l-6 6" />
+                      </svg>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Search bar — borderless, hover 较深底色 */}
+          <div className="px-2 py-1.5">
         <div className="relative">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
             stroke="currentColor" strokeWidth="1.5"
@@ -229,31 +389,62 @@ export function SkillsPanel() {
           </div>
         ) : (
           <>
-            {projectSkills.length > 0 && (
+            {customSkills.length > 0 && (
               <SkillGroup
-                label={t('skills.project')}
-                skills={projectSkills}
+                label={t('skills.mine')}
+                skills={customSkills}
                 selectedFile={selectedFile}
                 onSelect={handleSelect}
                 onOpenMenu={handleOpenMenu}
                 onToggleEnabled={toggleEnabled}
+                favorites={favorites}
+                ratings={ratings}
+                tags={tags}
+                onToggleFavorite={toggleFavorite}
+                onSetRating={setRating}
                 t={t}
               />
             )}
-            {globalSkills.length > 0 && (
+            {starredSkills.length > 0 && (
               <SkillGroup
-                label={t('skills.global')}
-                skills={globalSkills}
+                label={t('skills.favorites')}
+                skills={starredSkills}
                 selectedFile={selectedFile}
                 onSelect={handleSelect}
                 onOpenMenu={handleOpenMenu}
                 onToggleEnabled={toggleEnabled}
+                favorites={favorites}
+                ratings={ratings}
+                tags={tags}
+                onToggleFavorite={toggleFavorite}
+                onSetRating={setRating}
                 t={t}
               />
             )}
+            {categoryGroups.map(({ label, skills: groupSkills }) => (
+              <SkillGroup
+                key={label}
+                label={label}
+                skills={groupSkills}
+                selectedFile={selectedFile}
+                onSelect={handleSelect}
+                onOpenMenu={handleOpenMenu}
+                onToggleEnabled={toggleEnabled}
+                favorites={favorites}
+                ratings={ratings}
+                tags={tags}
+                onToggleFavorite={toggleFavorite}
+                onSetRating={setRating}
+                t={t}
+              />
+            ))}
           </>
         )}
       </div>
+        </>
+      ) : (
+        <SkillMarketplace />
+      )}
 
       {/* Context menu — rendered via portal to escape overflow-hidden + backdrop-filter ancestors */}
       {contextMenu && createPortal(
@@ -340,6 +531,286 @@ export function SkillsPanel() {
         </div>,
         document.body
       )}
+
+      {/* Detail panel — larger view opened by clicking a skill card, with
+          category/rating info, favorite toggle and quick actions. */}
+      {detailSkill && (
+        <SkillDetailModal
+          skill={detailSkill}
+          category={t(`skillCategory.${inferSkillCategory(slugOf(detailSkill), detailSkill.description, tags[slugOf(detailSkill)])}`)}
+          favorite={Boolean(favorites[slugOf(detailSkill)])}
+          rating={ratings[slugOf(detailSkill)] ?? 0}
+          tags={tags[slugOf(detailSkill)] ?? []}
+          onSetTags={(next) => setTags(slugOf(detailSkill), next)}
+          onToggleFavorite={() => toggleFavorite(slugOf(detailSkill))}
+          onSetRating={(r) => setRating(slugOf(detailSkill), r)}
+          onClose={() => setDetailSkill(null)}
+          onUseInInput={() => { handleUseInInput(detailSkill); setDetailSkill(null); }}
+          onEdit={() => handleEdit(detailSkill)}
+          t={t}
+        />
+      )}
+    </div>
+  );
+}
+
+/* Larger detail panel for a single skill — rendered as a centered modal so
+   there's much more room than the narrow sidebar list affords. */
+function SkillDetailModal({
+  skill,
+  category,
+  favorite,
+  rating,
+  tags,
+  onSetTags,
+  onToggleFavorite,
+  onSetRating,
+  onClose,
+  onUseInInput,
+  onEdit,
+  t,
+}: {
+  skill: SkillInfo;
+  category: string;
+  favorite: boolean;
+  rating: number;
+  tags: string[];
+  onSetTags: (tags: string[]) => void;
+  onToggleFavorite: () => void;
+  onSetRating: (rating: number) => void;
+  onClose: () => void;
+  onUseInInput: () => void;
+  onEdit: () => void;
+  t: (key: string) => string;
+}) {
+  const [tagDraft, setTagDraft] = useState('');
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const addTag = () => {
+    const v = tagDraft.trim();
+    if (!v) return;
+    if (!tags.includes(v)) onSetTags([...tags, v]);
+    setTagDraft('');
+  };
+  const removeTag = (tag: string) => onSetTags(tags.filter((x) => x !== tag));
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center
+        bg-black/40 animate-fade-in"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-[640px] max-w-[90vw] max-h-[80vh] flex flex-col
+          bg-bg-card border border-border-subtle rounded-2xl shadow-lg overflow-hidden"
+      >
+        {/* Header */}
+        <div className="flex items-start gap-3 px-5 py-4 border-b border-border-subtle">
+          <span className="flex-shrink-0 w-9 h-9 rounded-xl bg-accent/10
+            flex items-center justify-center text-accent mt-0.5">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+            </svg>
+          </span>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <h2 className="text-[15px] font-medium text-text-primary truncate">
+                {skill.name}
+              </h2>
+              <span className={`flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold
+                ${skill.scope === 'global' ? 'bg-blue-500/20 text-blue-400'
+                  : skill.scope === 'custom' ? 'bg-amber-400/20 text-amber-500'
+                  : 'bg-green-500/20 text-green-400'}`}>
+                {skill.scope === 'global' ? t('skills.global')
+                  : skill.scope === 'custom' ? t('skills.mine')
+                  : t('skills.project')}
+              </span>
+              {category && (
+                <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] font-medium
+                  bg-bg-secondary text-text-tertiary">
+                  {category}
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-text-muted mt-1.5 leading-relaxed">
+              {skill.description}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="flex-shrink-0 p-1 rounded-lg text-text-tertiary
+              hover:text-text-primary hover:bg-bg-secondary transition-smooth"
+            title={t('skills.detailClose')}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5">
+              <path d="M4 4l8 8M12 4l-8 8" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {/* Favorite + rating */}
+          <div className="flex items-center gap-4">
+            <button
+              onClick={onToggleFavorite}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs
+                border transition-smooth
+                ${favorite
+                  ? 'border-amber-400/40 bg-amber-400/10 text-amber-400'
+                  : 'border-border-subtle text-text-tertiary hover:text-text-primary'
+                }`}
+              title={favorite ? t('skills.removeFavorite') : t('skills.addFavorite')}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill={favorite ? 'currentColor' : 'none'}
+                stroke="currentColor" strokeWidth="1.5">
+                <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+              </svg>
+              {favorite ? t('skills.removeFavorite') : t('skills.addFavorite')}
+            </button>
+            <div className="flex items-center gap-1">
+              <span className="text-xs text-text-tertiary mr-1">{t('skills.rating')}</span>
+              <StarRating rating={rating} onSetRating={onSetRating} size={16} />
+            </div>
+          </div>
+
+          {/* Tags — editable; also boost auto-suggestion relevance */}
+          <div>
+            <div className="text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1.5">
+              {t('skills.tags')}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {tags.map((tag) => (
+                <span
+                  key={tag}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-md
+                    bg-bg-secondary text-text-secondary"
+                >
+                  {tag}
+                  <button
+                    onClick={() => removeTag(tag)}
+                    className="hover:text-error transition-smooth"
+                    title={t('skills.removeTag')}
+                  >
+                    <svg width="8" height="8" viewBox="0 0 10 10" fill="none"
+                      stroke="currentColor" strokeWidth="1.5">
+                      <path d="M2 2l6 6M8 2l-6 6" />
+                    </svg>
+                  </button>
+                </span>
+              ))}
+              <input
+                value={tagDraft}
+                onChange={(e) => setTagDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { e.preventDefault(); addTag(); }
+                  else if (e.key === 'Backspace' && !tagDraft && tags.length) removeTag(tags[tags.length - 1]);
+                }}
+                onBlur={addTag}
+                placeholder={t('skills.addTag')}
+                className="flex-1 min-w-[100px] px-2 py-1 text-[11px] bg-transparent
+                  rounded-md text-text-primary placeholder:text-text-tertiary
+                  outline-none hover:bg-bg-tertiary focus:bg-bg-tertiary transition-smooth"
+              />
+            </div>
+          </div>
+
+          {/* Tools */}
+          {skill.allowed_tools && skill.allowed_tools.length > 0 && (
+            <div>
+              <div className="text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1.5">
+                {t('skills.tools')}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {skill.allowed_tools.map((tool) => (
+                  <span key={tool} className="px-2 py-1 text-[11px] rounded-md bg-accent/10 text-accent font-medium">
+                    {tool}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Metadata */}
+          {(skill.model || skill.context || skill.version || skill.agent) && (
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+              {skill.model && (
+                <div><span className="text-text-tertiary">{t('skills.model')}: </span><span className="text-text-primary">{skill.model}</span></div>
+              )}
+              {skill.context && (
+                <div><span className="text-text-tertiary">{t('skills.context')}: </span><span className="text-text-primary">{skill.context}</span></div>
+              )}
+              {skill.version && (
+                <div><span className="text-text-tertiary">{t('skills.version')}: </span><span className="text-text-primary">{skill.version}</span></div>
+              )}
+              {skill.agent && (
+                <div><span className="text-text-tertiary">Agent: </span><span className="text-text-primary">{skill.agent}</span></div>
+              )}
+            </div>
+          )}
+
+          {/* Path */}
+          <div className="text-[11px] text-text-tertiary font-mono break-all">
+            {skill.path}
+          </div>
+        </div>
+
+        {/* Footer actions */}
+        <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-border-subtle">
+          <button
+            onClick={onEdit}
+            className="px-3 py-1.5 rounded-lg text-xs text-text-primary
+              border border-border-subtle hover:bg-bg-secondary transition-smooth"
+          >
+            {t('skills.edit')}
+          </button>
+          <button
+            onClick={onUseInInput}
+            className="px-3 py-1.5 rounded-lg text-xs text-text-inverse
+              bg-accent hover:bg-accent-hover transition-smooth"
+          >
+            {t('skills.useInInput')}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+/* Compact 1-5 star rating control, shared by the card and the detail panel. */
+function StarRating({
+  rating,
+  onSetRating,
+  size = 12,
+}: {
+  rating: number;
+  onSetRating: (rating: number) => void;
+  size?: number;
+}) {
+  return (
+    <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+      {[1, 2, 3, 4, 5].map((n) => (
+        <button
+          key={n}
+          onClick={() => onSetRating(rating === n ? 0 : n)}
+          className="text-amber-400 hover:scale-110 transition-transform"
+          title={`${n}`}
+        >
+          <svg width={size} height={size} viewBox="0 0 16 16" fill={n <= rating ? 'currentColor' : 'none'}
+            stroke="currentColor" strokeWidth="1.2">
+            <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+          </svg>
+        </button>
+      ))}
     </div>
   );
 }
@@ -352,6 +823,11 @@ function SkillGroup({
   onSelect,
   onOpenMenu,
   onToggleEnabled,
+  favorites,
+  ratings,
+  tags,
+  onToggleFavorite,
+  onSetRating,
   t,
 }: {
   label: string;
@@ -360,6 +836,11 @@ function SkillGroup({
   onSelect: (skill: SkillInfo) => void;
   onOpenMenu: (e: React.MouseEvent, skill: SkillInfo) => void;
   onToggleEnabled: (skill: SkillInfo) => void;
+  favorites: Record<string, boolean>;
+  ratings: Record<string, number>;
+  tags: Record<string, string[]>;
+  onToggleFavorite: (slug: string) => void;
+  onSetRating: (slug: string, rating: number) => void;
   t: (key: string) => string;
 }) {
   const [collapsed, setCollapsed] = useState(false);
@@ -393,6 +874,11 @@ function SkillGroup({
           onSelect={onSelect}
           onOpenMenu={onOpenMenu}
           onToggleEnabled={onToggleEnabled}
+          favorite={Boolean(favorites[slugOf(skill)])}
+          rating={ratings[slugOf(skill)] ?? 0}
+          tags={tags[slugOf(skill)] ?? []}
+          onToggleFavorite={onToggleFavorite}
+          onSetRating={onSetRating}
           t={t}
         />
       ))}
@@ -400,13 +886,19 @@ function SkillGroup({
   );
 }
 
-/* Skill card — richer display with tools, metadata, toggle */
+/* Skill card — richer display with tools, metadata, toggle, favorite/rating
+   and a hover tooltip with the full description. */
 function SkillCard({
   skill,
   isSelected,
   onSelect,
   onOpenMenu,
   onToggleEnabled,
+  favorite,
+  rating,
+  tags,
+  onToggleFavorite,
+  onSetRating,
   t,
 }: {
   skill: SkillInfo;
@@ -414,15 +906,23 @@ function SkillCard({
   onSelect: (skill: SkillInfo) => void;
   onOpenMenu: (e: React.MouseEvent, skill: SkillInfo) => void;
   onToggleEnabled: (skill: SkillInfo) => void;
+  favorite: boolean;
+  rating: number;
+  tags: string[];
+  onToggleFavorite: (slug: string) => void;
+  onSetRating: (slug: string, rating: number) => void;
   t: (key: string) => string;
 }) {
   const isDisabled = skill.disable_model_invocation === true;
+  const [hovered, setHovered] = useState(false);
 
   return (
     <div
       onClick={() => onSelect(skill)}
       onContextMenu={(e) => onOpenMenu(e, skill)}
-      className={`mx-1.5 mb-1 px-2.5 py-2 rounded-lg cursor-pointer
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      className={`relative mx-1.5 mb-1 px-2.5 py-2 rounded-lg cursor-pointer
         transition-smooth group border
         ${isDisabled ? 'opacity-50' : ''}
         ${isSelected
@@ -430,6 +930,18 @@ function SkillCard({
           : 'border-transparent hover:bg-bg-secondary hover:border-border-subtle'
         }`}
     >
+      {/* Hover tooltip — full description, shown below the card */}
+      {hovered && (
+        <div
+          className="absolute left-1.5 right-1.5 top-full mt-1 z-40 p-2.5
+            rounded-lg border border-border-subtle bg-bg-card shadow-lg
+            pointer-events-none animate-fade-in"
+        >
+          <div className="text-[12px] font-medium text-text-primary mb-1">{skill.name}</div>
+          <p className="text-[11px] text-text-muted leading-relaxed">{skill.description}</p>
+        </div>
+      )}
+
       {/* Row 1: Name + scope badge + actions */}
       <div className="flex items-center gap-1.5">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
@@ -444,9 +956,23 @@ function SkillCard({
         </span>
         <span className={`flex-shrink-0 w-3.5 h-3.5 rounded text-[8px]
           font-bold flex items-center justify-center
-          ${skill.scope === 'global' ? 'bg-blue-500/20 text-blue-400' : 'bg-green-500/20 text-green-400'}`}>
-          {skill.scope === 'global' ? 'G' : 'P'}
+          ${skill.scope === 'global' ? 'bg-blue-500/20 text-blue-400'
+            : skill.scope === 'custom' ? 'bg-amber-400/20 text-amber-500'
+            : 'bg-green-500/20 text-green-400'}`}>
+          {skill.scope === 'global' ? 'G' : skill.scope === 'custom' ? 'C' : 'P'}
         </span>
+
+        {/* Favorite star */}
+        <button
+          onClick={(e) => { e.stopPropagation(); onToggleFavorite(slugOf(skill)); }}
+          className={`flex-shrink-0 ${favorite ? 'text-amber-400' : 'text-text-tertiary opacity-0 group-hover:opacity-100'}`}
+          title={favorite ? t('skills.removeFavorite') : t('skills.addFavorite')}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill={favorite ? 'currentColor' : 'none'}
+            stroke="currentColor" strokeWidth="1.5">
+            <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+          </svg>
+        </button>
 
         {/* Toggle switch */}
         <button
@@ -480,7 +1006,27 @@ function SkillCard({
         {skill.description}
       </p>
 
-      {/* Row 3: Allowed tools as tag badges */}
+      {/* Row 3: Rating stars — click to rate, high ratings promote the skill to Favorites */}
+      <div className="pl-5 mt-1">
+        <StarRating rating={rating} onSetRating={(r) => onSetRating(slugOf(skill), r)} size={11} />
+      </div>
+
+      {/* Row 4: Tags */}
+      {tags.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-1.5 pl-5">
+          {tags.map((tag) => (
+            <span
+              key={tag}
+              className="px-1.5 py-0.5 text-[9px] rounded-md
+                bg-bg-secondary text-text-tertiary font-medium"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Row 5: Allowed tools as tag badges */}
       {skill.allowed_tools && skill.allowed_tools.length > 0 && (
         <div className="flex flex-wrap gap-1 mt-1.5 pl-5">
           {skill.allowed_tools.map((tool) => (
@@ -495,7 +1041,7 @@ function SkillCard({
         </div>
       )}
 
-      {/* Row 4: Metadata (model, context, version) */}
+      {/* Row 6: Metadata (model, context, version) */}
       {(skill.model || skill.context || skill.version) && (
         <div className="flex items-center gap-2 mt-1 pl-5 text-[9px] text-text-tertiary">
           {skill.model && (
@@ -512,3 +1058,4 @@ function SkillCard({
     </div>
   );
 }
+

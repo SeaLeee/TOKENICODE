@@ -124,7 +124,10 @@ function McpServerCardCompact({
   t: (key: string) => string;
 }) {
   const envCount = Object.keys(server.config.env).length;
-  const cmdDisplay = [server.config.command, ...server.config.args].join(' ');
+  const isRemote = server.config.type === 'http' || server.config.type === 'sse';
+  const cmdDisplay = isRemote
+    ? (server.config.url || '')
+    : [server.config.command, ...server.config.args].join(' ');
 
   return (
     <div className="px-4 py-3 rounded-lg transition-smooth group border
@@ -193,6 +196,7 @@ function McpServerForm({
   t: (key: string) => string;
 }) {
   const [name, setName] = useState(server?.name || '');
+  const [type, setType] = useState(server?.config.type || 'stdio');
   const [command, setCommand] = useState(server?.config.command || '');
   const [argsText, setArgsText] = useState(server?.config.args.join('\n') || '');
   const [envText, setEnvText] = useState(
@@ -200,10 +204,16 @@ function McpServerForm({
       ? Object.entries(server.config.env).map(([k, v]) => `${k}=${v}`).join('\n')
       : ''
   );
+  const [url, setUrl] = useState(server?.config.url || '');
   const [isSaving, setIsSaving] = useState(false);
 
+  const isRemote = type === 'http' || type === 'sse';
+  const canSave = !!name.trim() && (isRemote ? !!url.trim() : !!command.trim()) && !isSaving;
+
   const handleSave = useCallback(async () => {
-    if (!name.trim() || !command.trim()) return;
+    const remote = type === 'http' || type === 'sse';
+    if (!name.trim()) return;
+    if (remote ? !url.trim() : !command.trim()) return;
     setIsSaving(true);
     try {
       const args = argsText.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -216,11 +226,14 @@ function McpServerForm({
           env[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
         }
       });
-      await onSave(name.trim(), { command: command.trim(), args, env, type: 'stdio' });
+      const config: McpServerConfig = remote
+        ? { command: '', args: [], env: {}, type, url: url.trim() }
+        : { command: command.trim(), args, env, type: 'stdio' };
+      await onSave(name.trim(), config);
     } finally {
       setIsSaving(false);
     }
-  }, [name, command, argsText, envText, onSave]);
+  }, [name, type, command, argsText, envText, url, onSave]);
 
   const inputClass = `w-full px-3 py-2 text-[13px] bg-bg-chat border border-border-subtle
     rounded-lg outline-none focus:border-accent text-text-primary placeholder:text-text-tertiary`;
@@ -242,43 +255,73 @@ function McpServerForm({
       </div>
       <div>
         <label className="text-xs text-text-muted">
-          {t('mcp.command')}
+          {t('mcp.type')}
         </label>
-        <input
-          value={command}
-          onChange={(e) => setCommand(e.target.value)}
-          placeholder={t('mcp.commandPlaceholder')}
+        <select
+          value={type}
+          onChange={(e) => setType(e.target.value)}
           className={inputClass}
-        />
+        >
+          <option value="stdio">stdio</option>
+          <option value="http">http</option>
+          <option value="sse">sse</option>
+        </select>
       </div>
-      <div>
-        <label className="text-xs text-text-muted">
-          {t('mcp.args')}
-        </label>
-        <textarea
-          value={argsText}
-          onChange={(e) => setArgsText(e.target.value)}
-          placeholder={t('mcp.argsHint')}
-          rows={2}
-          className={`${inputClass} resize-none font-mono`}
-        />
-      </div>
-      <div>
-        <label className="text-xs text-text-muted">
-          {t('mcp.env')}
-        </label>
-        <textarea
-          value={envText}
-          onChange={(e) => setEnvText(e.target.value)}
-          placeholder={t('mcp.envHint')}
-          rows={2}
-          className={`${inputClass} resize-none font-mono`}
-        />
-      </div>
+      {isRemote ? (
+        <div>
+          <label className="text-xs text-text-muted">
+            {t('mcp.url')}
+          </label>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder={t('mcp.urlPlaceholder')}
+            className={inputClass}
+          />
+        </div>
+      ) : (
+        <>
+          <div>
+            <label className="text-xs text-text-muted">
+              {t('mcp.command')}
+            </label>
+            <input
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              placeholder={t('mcp.commandPlaceholder')}
+              className={inputClass}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-text-muted">
+              {t('mcp.args')}
+            </label>
+            <textarea
+              value={argsText}
+              onChange={(e) => setArgsText(e.target.value)}
+              placeholder={t('mcp.argsHint')}
+              rows={2}
+              className={`${inputClass} resize-none font-mono`}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-text-muted">
+              {t('mcp.env')}
+            </label>
+            <textarea
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              placeholder={t('mcp.envHint')}
+              rows={2}
+              className={`${inputClass} resize-none font-mono`}
+            />
+          </div>
+        </>
+      )}
       <div className="flex gap-3">
         <button
           onClick={handleSave}
-          disabled={!name.trim() || !command.trim() || isSaving}
+          disabled={!canSave}
           className="flex-1 px-4 py-2 text-[13px] font-medium bg-accent text-text-inverse rounded-lg
             hover:bg-accent-hover disabled:opacity-40 transition-smooth"
         >

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { SessionListItem } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { t as tStatic } from '../../lib/i18n';
+import { useSessionStore } from '../../stores/sessionStore';
 
 function formatRelativeTime(ms: number): string {
   if (!ms) return '';
@@ -91,6 +92,7 @@ export function SessionItem({
   inset = 'normal',
 }: SessionItemProps) {
   const t = useT();
+  const needsAttention = useSessionStore((s) => s.needsAttention.has(session.id));
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -217,6 +219,13 @@ export function SessionItem({
           <span className="flex-shrink-0 w-2 h-2 rounded-full bg-success
             shadow-[0_0_6px_var(--color-accent-glow)]
             animate-pulse-soft" />
+        )}
+        {needsAttention && (
+          <span
+            className="flex-shrink-0 w-2 h-2 rounded-full bg-error
+              shadow-[0_0_6px_rgba(239,68,68,0.7)] animate-pulse-soft"
+            title={t('notification.permissionNeeded')}
+          />
         )}
       </div>
       {contentSnippet && (

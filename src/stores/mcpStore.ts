@@ -8,6 +8,8 @@ export interface McpServerConfig {
   args: string[];
   env: Record<string, string>;
   type: string;
+  /** HTTP/SSE remote endpoint URL (absent for stdio servers). */
+  url?: string;
 }
 
 export interface McpServer {
@@ -76,9 +78,26 @@ function parseServers(mcpServers: Record<string, unknown> | undefined): McpServe
         args: Array.isArray(cfg.args) ? (cfg.args as string[]) : [],
         env: (cfg.env as Record<string, string>) || {},
         type: (cfg.type as string) || 'stdio',
+        url: typeof cfg.url === 'string' ? cfg.url : undefined,
       },
     };
   });
+}
+
+/** Serialize a server config back to the on-disk `mcpServers` entry shape. */
+function serializeConfig(config: McpServerConfig): Record<string, unknown> {
+  if (config.type === 'http' || config.type === 'sse') {
+    return {
+      type: config.type,
+      ...(config.url ? { url: config.url } : {}),
+    };
+  }
+  return {
+    command: config.command,
+    args: config.args,
+    env: Object.keys(config.env).length > 0 ? config.env : undefined,
+    type: config.type,
+  };
 }
 
 // --- Store ---
@@ -114,12 +133,7 @@ export const useMcpStore = create<McpState>()((set) => ({
   addServer: async (name, config) => {
     const json = await readClaudeJson();
     const mcpServers = (json.mcpServers as Record<string, unknown>) || {};
-    mcpServers[name] = {
-      command: config.command,
-      args: config.args,
-      env: Object.keys(config.env).length > 0 ? config.env : undefined,
-      type: config.type,
-    };
+    mcpServers[name] = serializeConfig(config);
     json.mcpServers = mcpServers;
     await writeClaudeJson(json);
     const servers = parseServers(mcpServers);
@@ -132,12 +146,7 @@ export const useMcpStore = create<McpState>()((set) => ({
     if (oldName !== newName) {
       delete mcpServers[oldName];
     }
-    mcpServers[newName] = {
-      command: config.command,
-      args: config.args,
-      env: Object.keys(config.env).length > 0 ? config.env : undefined,
-      type: config.type,
-    };
+    mcpServers[newName] = serializeConfig(config);
     json.mcpServers = mcpServers;
     await writeClaudeJson(json);
     const servers = parseServers(mcpServers);

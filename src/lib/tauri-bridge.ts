@@ -5,6 +5,8 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 
 export interface StartSessionParams {
   prompt: string;
+  /** Image paths encoded by Rust as Claude stream-json image content blocks. */
+  image_paths?: string[];
   cwd: string;
   model?: string;
   /** Desk-generated process key (stdinId) — used as key in Rust StdinManager/ProcessManager.
@@ -90,7 +92,7 @@ export interface SkillInfo {
   name: string;
   description: string;
   path: string;
-  scope: 'global' | 'project';
+  scope: 'global' | 'project' | 'custom';
   disable_model_invocation?: boolean;
   user_invocable?: boolean;
   allowed_tools?: string[];
@@ -99,6 +101,52 @@ export interface SkillInfo {
   context?: string;
   agent?: string;
   version?: string;
+}
+
+// --- Skill marketplace (Tencent SkillHub) ---
+
+export interface SkillHubNamespace {
+  handle: string;
+  displayName: string;
+  canonicalName: string;
+}
+
+export interface SkillHubPublisher {
+  name: string;
+  verified: boolean;
+  certifiedName: string;
+}
+
+export interface SkillHubSkill {
+  slug: string;
+  name: string;
+  namespace: SkillHubNamespace;
+  description: string;
+  /** Chinese description; the Rust struct keeps the snake_case key via explicit rename. */
+  description_zh?: string;
+  iconUrl: string;
+  score: number;
+  downloads: number;
+  installs: number;
+  version: string;
+  category: string;
+  source: string;
+  /** Opaque: the API returns an object ({"requires_api_key":"false"}), not an array. */
+  labels?: unknown;
+  publisher: SkillHubPublisher;
+  verified: boolean;
+}
+
+export interface SkillHubSearchResult {
+  skills: SkillHubSkill[];
+  total: number;
+}
+
+export interface InstallSkillResult {
+  slug: string;
+  path: string;
+  name: string;
+  description: string;
 }
 
 export interface CliStatus {
@@ -126,6 +174,12 @@ export interface CleanupResult {
 export interface AuthStatus {
   authenticated: boolean;
   unknown?: boolean;
+}
+
+export interface NativeClaudeConfig {
+  model: string | null;
+  base_url: string | null;
+  has_auth: boolean;
 }
 
 export interface StepResult {
@@ -186,10 +240,12 @@ export interface ProvidersFile {
 export interface UnifiedCommand {
   name: string;
   description: string;
-  source: 'builtin' | 'global' | 'project';
+  source: 'builtin' | 'global' | 'project' | 'custom';
   category: 'builtin' | 'command' | 'skill';
   has_args: boolean;
   path?: string;
+  /** SKILL.md mtime (unix ms) — used to order "recently downloaded" skills. */
+  modified?: number;
   immediate: boolean;
   execution?: 'ui' | 'cli' | 'session';
 }
@@ -203,8 +259,11 @@ export const bridge = {
   sendMessage: (sessionId: string, message: string) =>
     invoke<void>('send_message', { sessionId, message }),
 
-  sendStdin: (sessionId: string, message: string) =>
-    invoke<void>('send_stdin', { sessionId, message }),
+  resolveCcswitchTurnModel: (message: string, imagePaths?: string[]) =>
+    invoke<string | null>('resolve_ccswitch_turn_model', { message, imagePaths }),
+
+  sendStdin: (sessionId: string, message: string, imagePaths?: string[]) =>
+    invoke<void>('send_stdin', { sessionId, message, imagePaths }),
 
   sendRawStdin: (sessionId: string, message: string) =>
     invoke<void>('send_raw_stdin', { sessionId, message }),
@@ -258,6 +317,9 @@ export const bridge = {
 
   writeFileContent: (path: string, content: string, tabId?: string) =>
     invoke<void>('write_file_content', { path, content, tabId: tabId ?? null }),
+
+  writeFileBase64: (path: string, dataUrl: string, tabId?: string) =>
+    invoke<void>('write_file_base64', { path, dataUrl, tabId: tabId ?? null }),
 
   copyFile: (src: string, dest: string, tabId?: string) =>
     invoke<void>('copy_file', { src, dest, tabId: tabId ?? null }),
@@ -320,8 +382,8 @@ export const bridge = {
     invoke<SlashCommand[]>('list_slash_commands', { cwd }),
 
   // Skills
-  listSkills: (cwd?: string) =>
-    invoke<SkillInfo[]>('list_skills', { cwd }),
+  listSkills: (cwd?: string, extraSkillDirs?: string[]) =>
+    invoke<SkillInfo[]>('list_skills', { cwd, extraSkillDirs: extraSkillDirs ?? null }),
 
   readSkill: (path: string, tabId?: string) =>
     invoke<string>('read_skill', { path, tabId: tabId ?? null }),
@@ -335,9 +397,24 @@ export const bridge = {
   toggleSkillEnabled: (path: string, enabled: boolean, tabId?: string) =>
     invoke<void>('toggle_skill_enabled', { path, enabled, tabId: tabId ?? null }),
 
+  // Skill marketplace (Tencent SkillHub)
+  searchSkillHub: (params: {
+    keyword?: string;
+    page?: number;
+    pageSize?: number;
+    sortBy?: string;
+  }) =>
+    invoke<SkillHubSearchResult>('search_skillhub', { params }),
+
+  installSkill: (slug: string, namespace?: string) =>
+    invoke<InstallSkillResult>('install_skill', { slug, namespace: namespace || null }),
+
+  importCustomSkills: (path: string) =>
+    invoke<string[]>('import_custom_skills', { path }),
+
   // Unified commands (commands + skills)
-  listAllCommands: (cwd?: string) =>
-    invoke<UnifiedCommand[]>('list_all_commands', { cwd }),
+  listAllCommands: (cwd?: string, extraSkillDirs?: string[]) =>
+    invoke<UnifiedCommand[]>('list_all_commands', { cwd, extraSkillDirs: extraSkillDirs ?? null }),
 
   // Git commands (safe, allowlisted operations only)
   runGitCommand: (cwd: string, args: string[]) =>
@@ -409,6 +486,9 @@ export const bridge = {
   checkClaudeAuth: () =>
     invoke<AuthStatus>('check_claude_auth'),
 
+  getClaudeNativeConfig: () =>
+    invoke<NativeClaudeConfig>('get_claude_native_config'),
+
   openTerminalLogin: () =>
     invoke<void>('open_terminal_login'),
 
@@ -454,6 +534,10 @@ export const bridge = {
 
   testProviderConnection: (baseUrl: string, apiFormat: string, apiKey: string, model: string, proxyUrl?: string) =>
     invoke<ConnectionTestResult>('test_provider_connection', { baseUrl, apiFormat, apiKey, model, proxyUrl: proxyUrl || null }),
+
+  /** One-shot chat against a provider endpoint (skill routing / lightweight tasks). */
+  providerChat: (baseUrl: string, apiFormat: string, apiKey: string, model: string, prompt: string, proxyUrl?: string) =>
+    invoke<string>('provider_chat', { baseUrl, apiFormat, apiKey, model, prompt, proxyUrl: proxyUrl || null }),
 
 
   // --- SDK Control Protocol ---

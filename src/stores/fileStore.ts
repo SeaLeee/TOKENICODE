@@ -3,7 +3,7 @@ import { bridge, FileNode, RecentProject } from '../lib/tauri-bridge';
 import { computeRevealExpansions, findNodeByPath, reconcilePathToRoot } from './fileReveal';
 
 export type FileChangeKind = 'created' | 'modified' | 'removed';
-export type PreviewMode = 'preview' | 'source' | 'edit';
+export type PreviewMode = 'preview' | 'source' | 'edit' | 'storyboard';
 
 // Batch buffer for markFileChanged — collect changes within a single frame, flush once via rAF
 const _pendingChanges = new Map<string, FileChangeKind>();
@@ -214,9 +214,9 @@ export const useFileStore = create<FileState>()((set, get) => ({
 
   setPreviewMode: (mode: PreviewMode) => {
     const state = get();
-    if (mode === 'edit') {
+    if (mode === 'edit' || mode === 'storyboard') {
       // Entering edit mode: initialize editContent from fileContent
-      set({ previewMode: mode, editContent: state.fileContent });
+      set({ previewMode: mode, editContent: state.editContent ?? state.fileContent });
     } else {
       set({ previewMode: mode });
     }
@@ -231,7 +231,12 @@ export const useFileStore = create<FileState>()((set, get) => ({
     try {
       await bridge.writeFileContent(selectedFile, editContent);
       // Update fileContent to match saved content
-      set({ fileContent: editContent, editContent: null, isSaving: false, previewMode: 'preview' });
+      set({
+        fileContent: editContent,
+        editContent: null,
+        isSaving: false,
+        previewMode: get().previewMode === 'storyboard' ? 'storyboard' : 'preview',
+      });
     } catch {
       set({ isSaving: false });
     }

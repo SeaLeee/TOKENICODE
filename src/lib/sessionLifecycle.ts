@@ -33,7 +33,7 @@ export interface SpawnParams {
   stdinId: string;
   cwdSnapshot: string;
   configSnapshot: {
-    model: string;
+    model?: string;
     providerId: string;
     thinkingLevel: ThinkingLevel;
     permissionMode: CliPermissionMode;

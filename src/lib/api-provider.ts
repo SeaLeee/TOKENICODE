@@ -147,6 +147,22 @@ export function getAutoCompactThreshold(modelId?: string): number {
 }
 
 /**
+ * Full context size in tokens for a Claude API usage object. The raw
+ * `input_tokens` field only counts non-cached input tokens — for a cached turn
+ * (the common case after the first message) the bulk of the context sits in
+ * `cache_read_input_tokens`, so summing all three is the only way to get the
+ * true window fullness. Mirrors the VSCode Claude Code context meter.
+ */
+export function fullContextTokens(
+  usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null,
+): number {
+  if (!usage) return 0;
+  return (usage.input_tokens ?? 0)
+    + (usage.cache_read_input_tokens ?? 0)
+    + (usage.cache_creation_input_tokens ?? 0);
+}
+
+/**
  * Result of model resolution — either a mapped model name or an error.
  */
 export type ModelResolution =
@@ -199,6 +215,16 @@ export function resolveModelForProvider(selectedModel: string): string {
   const r = resolveModelOrError(selectedModel);
   const model = r.ok ? r.model : selectedModel;
   return CLI_MODEL_MAP[model as ModelId] ?? model;
+}
+
+/**
+ * Native mode = no TOKENICODE-owned provider is selected. In this state the
+ * CLI falls back to its own config (`~/.claude/settings.json`, managed by
+ * CCswitch / the VS Code extension), so TOKENICODE must NOT force a model or
+ * inject env. Returns true when the model/provider should be left to the CLI.
+ */
+export function isNativeMode(): boolean {
+  return useProviderStore.getState().activeProviderId == null;
 }
 
 /**

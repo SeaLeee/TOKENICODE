@@ -40,7 +40,7 @@ beforeEach(() => {
   useSettingsStore.setState({
     selectedModel: 'claude-sonnet-4-6',
     thinkingLevel: 'medium',
-    sessionMode: 'code',
+    sessionMode: 'auto',
   });
 });
 

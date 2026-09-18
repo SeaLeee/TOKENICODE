@@ -131,17 +131,21 @@ export function QuestionCard({ message, floating }: Props) {
       const owner = resolveOwner();
       if (!owner) return;
       const { setInteractionState, setSessionStatus, setActivityStatus } = useChatStore.getState();
-      const answers: Record<string, string> = {};
+      // Claude Code keys each answer by the question TEXT (not the numeric index)
+      // and reads `updatedInput.answers` as the tool result. Keying by index made
+      // the CLI treat every question as unanswered ("未作答").
+      const answers: Record<string, string | string[]> = {};
       questions.forEach((q, qIdx) => {
         if (useOther[qIdx] && otherText[qIdx]?.trim()) {
-          answers[String(qIdx)] = otherText[qIdx].trim();
+          answers[q.question] = otherText[qIdx].trim();
         } else {
           const selected = selectedMap[qIdx] || new Set<number>();
           const labels = Array.from(selected)
             .map((i) => q.options[i]?.label)
             .filter(Boolean);
           if (labels.length > 0) {
-            answers[String(qIdx)] = labels.join(', ');
+            // Multi-select takes an array of labels; single-select a bare string.
+            answers[q.question] = q.multiSelect ? labels : labels[0];
           }
         }
       });

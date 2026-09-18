@@ -267,7 +267,7 @@ function App() {
           if (useSessionStore.getState().selectedSessionId !== sessionId) {
             return { switchedTo: sessionId, aborted: true, note: 'User switched away during load' };
           }
-          const { messages, agents } = parseSessionMessages(rawMessages);
+          const { messages, agents, lastContextTokens } = parseSessionMessages(rawMessages);
           for (const agent of agents) useAgentStore.getState().upsertAgent(agent);
           for (const message of messages) {
             if ((message as any).toolResultContent) {
@@ -277,6 +277,9 @@ function App() {
             } else {
               addMessage(sessionId, message);
             }
+          }
+          if (lastContextTokens > 0) {
+            setSessionMeta(sessionId, { contextTokens: lastContextTokens });
           }
           setSessionStatus(sessionId, 'completed');
           return { switchedTo: sessionId, restored: false, messageCount: messages.length };

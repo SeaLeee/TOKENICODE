@@ -115,7 +115,7 @@ function makeSpawnParams(overrides?: Partial<SpawnParams>): SpawnParams {
       thinkingLevel: 'high',
       permissionMode: 'acceptEdits',
     },
-    sessionModeSnapshot: 'code',
+    sessionModeSnapshot: 'auto',
     sessionParams: {
       prompt: 'Hello',
       cwd: '/home/user/project',
@@ -199,7 +199,7 @@ describe('spawnSession', () => {
       stdinId: 'desk_123',
       cwdSnapshot: '/home/user/project',
       configSnapshot: expect.objectContaining({ model: 'claude-opus-4-20250514' }),
-      snapshotMode: 'code',
+      snapshotMode: 'auto',
       snapshotThinking: 'high',
       snapshotProviderId: 'default',
     }));

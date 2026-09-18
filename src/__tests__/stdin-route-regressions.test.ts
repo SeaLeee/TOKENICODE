@@ -53,6 +53,20 @@ describe('stdin route regressions', () => {
     expect(inputBarSource).toContain('cleanupStdinRoute(stdinId);');
   });
 
+  it('routes image attachments as multimodal input for direct and queued turns', () => {
+    expect(inputBarSource).toContain('const imagePaths = visionImagePaths(savedFiles);');
+    expect(inputBarSource).toContain('await bridge.resolveCcswitchTurnModel(text, imagePaths)');
+    expect(inputBarSource).toContain("routedModel === 'deepseek-v4-flash-vision-exp'");
+    expect(inputBarSource).toContain('await teardownSession(stdinId, tabId, \'switch\')');
+    expect(inputBarSource).toContain('(routedModel ?? undefined)');
+    expect(inputBarSource).toContain(": '__ccswitch_turn_route__'");
+    expect(inputBarSource).toContain('image_paths: imagePaths');
+    expect(inputBarSource).toContain('const pathOnlyFiles = files.filter((file) => !isVisionImageAttachment(file));');
+    expect(inputBarSource).toContain('attachments: [...files]');
+    expect(streamProcessorSource).toContain('bridge.sendStdin(flushStdinId, nextMsg, imagePaths)');
+    expect(streamProcessorSource).toContain('bridge.sendStdin(bgFlushStdinId, bgCombined, bgImagePaths)');
+  });
+
   it('tab switches snapshot the current draft before restoring the next tab', () => {
     expect(inputBarSource).toContain('previousSessionIdRef');
     expect(inputBarSource).toContain('textareaRef.current?.getText()');

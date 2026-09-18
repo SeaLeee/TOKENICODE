@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { bridge, SkillInfo } from '../lib/tauri-bridge';
+import { useSettingsStore } from './settingsStore';
 
 interface SkillState {
   skills: SkillInfo[];
@@ -38,7 +39,8 @@ export const useSkillStore = create<SkillState>()((set, get) => ({
   fetchSkills: async (cwd?: string) => {
     set({ isLoading: true });
     try {
-      const skills = await bridge.listSkills(cwd);
+      const dirs = useSettingsStore.getState().customSkillDirs;
+      const skills = await bridge.listSkills(cwd, dirs.length ? dirs : undefined);
       set({ skills, isLoading: false });
     } catch {
       set({ isLoading: false });

@@ -16,18 +16,28 @@ export type ModelId =
   | 'claude-opus-4-6-1m'
   | 'claude-sonnet-4-6'
   | 'claude-haiku-4-5-20251001';
-export type SessionMode = 'code' | 'ask' | 'plan' | 'bypass';
+export type SessionMode = 'auto' | 'ask' | 'plan' | 'editAuto';
 /** CLI permission mode for the SDK control protocol */
 export type CliPermissionMode = 'acceptEdits' | 'default' | 'plan' | 'bypassPermissions';
 export type Locale = 'zh' | 'en';
 
-/** Map frontend session mode to CLI permission mode */
+/**
+ * Map frontend session mode to CLI permission mode (VSCode Claude Code parity):
+ *   'ask'     → 'default'            (Manual — confirm every action)
+ *   'plan'    → 'plan'               (Plan only)
+ *   'editAuto'→ 'acceptEdits'        (Edit Auto — auto-accept file edits)
+ *   'auto'    → 'bypassPermissions'  (Auto — fully automatic, approve everything)
+ */
 export function mapSessionModeToPermissionMode(mode: SessionMode): CliPermissionMode {
   switch (mode) {
-    case 'code': return 'acceptEdits';
+    // 'auto' = fully automatic (approve all tool permissions) for VSCode parity.
+    // Maps to bypassPermissions so the Rust-side BypassModeMap auto-approves
+    // can_use_tool with zero frontend overhead; AskUserQuestion still reaches
+    // the UI (it is a question to the user, not a permission).
+    case 'auto': return 'bypassPermissions';
     case 'ask': return 'default';
     case 'plan': return 'plan';
-    case 'bypass': return 'bypassPermissions';
+    case 'editAuto': return 'acceptEdits';
   }
 }
 export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'max';
@@ -90,6 +100,14 @@ interface SettingsState {
   userDisplayName: string;
   /** Whether to show dotfiles (hidden files) in the file tree */
   showHiddenFiles: boolean;
+  /** Master switch: automatically suggest relevant installed skills while typing */
+  skillAutoSuggest: boolean;
+  /** Extra folders to scan for skills (each contains skill subfolders); higher priority. */
+  customSkillDirs: string[];
+  /** Auto-attach the top skill suggestion on submit */
+  skillAutoAttach: boolean;
+  /** Use an AI model (active provider) to enhance skill suggestions semantically */
+  skillAiEnhance: boolean;
 
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
@@ -121,6 +139,11 @@ interface SettingsState {
   setUserAvatarUrl: (url: string) => void;
   setUserDisplayName: (name: string) => void;
   toggleHiddenFiles: () => void;
+  toggleSkillAutoSuggest: () => void;
+  toggleSkillAutoAttach: () => void;
+  toggleSkillAiEnhance: () => void;
+  addCustomSkillDir: (dir: string) => void;
+  removeCustomSkillDir: (dir: string) => void;
 }
 
 // --- Theme cycle order ---
@@ -147,7 +170,7 @@ export const useSettingsStore = create<SettingsState>()(
       agentPanelOpen: false,
       workingDirectory: '',
       selectedModel: 'claude-sonnet-4-6',
-      sessionMode: 'bypass',
+      sessionMode: 'auto',
       locale: 'zh',
       fontSize: 18,
       sidebarWidth: 280,
@@ -163,6 +186,10 @@ export const useSettingsStore = create<SettingsState>()(
       userAvatarUrl: '',
       userDisplayName: '',
       showHiddenFiles: false,
+      skillAutoSuggest: true,
+      skillAutoAttach: false,
+      skillAiEnhance: false,
+      customSkillDirs: [],
 
       toggleTheme: () =>
         set((state) => ({ theme: nextTheme(state.theme) })),
@@ -263,10 +290,26 @@ export const useSettingsStore = create<SettingsState>()(
         set(() => ({ userDisplayName: name.slice(0, 20) })),
       toggleHiddenFiles: () =>
         set((state) => ({ showHiddenFiles: !state.showHiddenFiles })),
+      toggleSkillAutoSuggest: () =>
+        set((state) => ({ skillAutoSuggest: !state.skillAutoSuggest })),
+      toggleSkillAutoAttach: () =>
+        set((state) => ({ skillAutoAttach: !state.skillAutoAttach })),
+      toggleSkillAiEnhance: () =>
+        set((state) => ({ skillAiEnhance: !state.skillAiEnhance })),
+      addCustomSkillDir: (dir) =>
+        set((state) =>
+          state.customSkillDirs.includes(dir)
+            ? {}
+            : { customSkillDirs: [...state.customSkillDirs, dir] },
+        ),
+      removeCustomSkillDir: (dir) =>
+        set((state) => ({
+          customSkillDirs: state.customSkillDirs.filter((d) => d !== dir),
+        })),
     }),
     {
       name: 'tokenicode-settings',
-      version: 8,
+      version: 10,
       migrate: (persistedState: unknown, version: number) => {
         const persisted = persistedState as Record<string, unknown>;
         if (version === 0) {
@@ -326,6 +369,15 @@ export const useSettingsStore = create<SettingsState>()(
             persisted.selectedModel = opusUpgradeMap[current];
           }
         }
+        if (version < 9) {
+          // 'code' mode renamed to 'auto' for VSCode parity
+          if (persisted.sessionMode === 'code') persisted.sessionMode = 'auto';
+        }
+        if (version < 10) {
+          // 'bypass' split into 'editAuto' (acceptEdits) + 'auto' (bypassPermissions).
+          // Old 'bypass' meant "skip all permission checks", which is now 'auto'.
+          if (persisted.sessionMode === 'bypass') persisted.sessionMode = 'auto';
+        }
         return persisted;
       },
       partialize: (state) => ({
@@ -348,6 +400,10 @@ export const useSettingsStore = create<SettingsState>()(
         userAvatarUrl: state.userAvatarUrl,
         userDisplayName: state.userDisplayName,
         showHiddenFiles: state.showHiddenFiles,
+        skillAutoSuggest: state.skillAutoSuggest,
+        skillAutoAttach: state.skillAutoAttach,
+        skillAiEnhance: state.skillAiEnhance,
+        customSkillDirs: state.customSkillDirs,
       }),
     },
   ),
@@ -402,7 +458,8 @@ useSettingsStore.subscribe((state, prevState) => {
 
   const cliMode = mapSessionModeToPermissionMode(state.sessionMode);
 
-  // bypass uses --dangerously-skip-permissions at startup; can't switch TO bypass at runtime
+  // 'auto' maps to bypassPermissions, which is applied at startup via
+  // --dangerously-skip-permissions; it can't be switched to at runtime.
   if (cliMode === 'bypassPermissions') return;
 
   // Dynamically import to avoid circular deps

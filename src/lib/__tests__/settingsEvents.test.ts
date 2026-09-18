@@ -137,7 +137,7 @@ describe('settingsStore setters · emit on change', () => {
     const h = vi.fn();
     settingsEvents.on('session-mode-changed', h);
     const initial = useSettingsStore.getState().sessionMode;
-    const next = initial === 'code' ? 'ask' : 'code';
+    const next = initial === 'auto' ? 'ask' : 'auto';
     useSettingsStore.getState().setSessionMode(next);
     expect(h).toHaveBeenCalledTimes(1);
     expect(h).toHaveBeenCalledWith({ old: initial, next });

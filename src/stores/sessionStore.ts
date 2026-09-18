@@ -67,6 +67,10 @@ interface SessionState {
   customPreviews: Record<string, string>;
   /** Track which sessions are actively running (streaming/working) */
   runningSessions: Set<string>;
+  /** Sessions that need user attention (e.g. a permission request is waiting) */
+  needsAttention: Set<string>;
+  /** Ordered list of open session IDs shown in the browser-like tab strip */
+  openTabs: string[];
   /** Map stdinId → tabId so stream events can be routed to the correct session */
   stdinToTab: Record<string, string>;
   /** Content search results keyed by session ID */
@@ -89,6 +93,10 @@ interface SessionState {
   setSessionRunning: (sessionId: string, running: boolean) => void;
   /** Check if a session is currently running */
   isSessionRunning: (sessionId: string) => boolean;
+  /** Mark/unmark a session as needing the user's attention (red flashing dot) */
+  setAttention: (sessionId: string, on: boolean) => void;
+  /** Close a session tab (removes from the tab strip; does NOT delete from disk) */
+  closeTab: (id: string) => void;
   /** Register a stdinId → tabId mapping (persisted to sessionStorage) */
   registerStdinTab: (stdinId: string, tabId: string) => void;
   /** Remove a stdinId mapping on process exit (cleans sessionStorage too) */
@@ -122,6 +130,8 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   previousSessionId: null,
   customPreviews: loadCustomPreviewsSync(),
   runningSessions: new Set<string>(),
+  needsAttention: new Set<string>(),
+  openTabs: [],
   stdinToTab: loadStdinToTabSync(),
   contentSearchResults: new Map<string, ContentSearchResult>(),
   isContentSearching: false,
@@ -152,10 +162,21 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   setSelectedSession: (id) => {
     saveLastSessionId(id);
-    set((state) => ({
-      selectedSessionId: id,
-      previousSessionId: state.selectedSessionId !== id ? state.selectedSessionId : state.previousSessionId,
-    }));
+    set((state) => {
+      // Opening a session clears its "needs attention" flag (stops the red dot).
+      const needsAttention = new Set(state.needsAttention);
+      if (id) needsAttention.delete(id);
+      // Opening a session adds it to the browser-like tab strip.
+      const openTabs = id && !state.openTabs.includes(id)
+        ? [...state.openTabs, id]
+        : state.openTabs;
+      return {
+        selectedSessionId: id,
+        previousSessionId: state.selectedSessionId !== id ? state.selectedSessionId : state.previousSessionId,
+        needsAttention,
+        openTabs,
+      };
+    });
   },
 
   addDraftSession: (id, projectPath) => set((state) => {
@@ -172,6 +193,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     return {
       sessions: [draft, ...state.sessions],
       selectedSessionId: id,
+      openTabs: state.openTabs.includes(id) ? state.openTabs : [...state.openTabs, id],
     };
   }),
 
@@ -206,6 +228,13 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   isSessionRunning: (sessionId) => get().runningSessions.has(sessionId),
 
+  setAttention: (sessionId, on) => set((state) => {
+    const next = new Set(state.needsAttention);
+    if (on) next.add(sessionId);
+    else next.delete(sessionId);
+    return { needsAttention: next };
+  }),
+
   registerStdinTab: (stdinId, tabId) => {
     const next = { ...get().stdinToTab, [stdinId]: tabId };
     saveStdinToTab(next);
@@ -230,6 +259,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   removeDraft: (draftId) => set((state) => ({
     sessions: state.sessions.filter((s) => s.id !== draftId),
+    openTabs: state.openTabs.filter((t) => t !== draftId),
   })),
 
   promoteDraft: (oldDraftId, newRealId) => {
@@ -276,7 +306,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     }
 
     saveStdinToTab(stdinToTab);
-    return { sessions, selectedSessionId, previousSessionId, runningSessions, stdinToTab, customPreviews };
+
+    // 7) Migrate openTabs entries that referenced the draft id
+    const openTabs = state.openTabs.map((t) => (t === oldDraftId ? newRealId : t));
+
+    return { sessions, selectedSessionId, previousSessionId, runningSessions, stdinToTab, customPreviews, openTabs };
   });
   },
 
@@ -291,6 +325,17 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       previousSessionId: selectedSessionId,
     });
   },
+
+  closeTab: (id) => set((state) => {
+    const openTabs = state.openTabs.filter((t) => t !== id);
+    // If the closed tab was active, switch to the most-recent remaining tab.
+    const isActive = state.selectedSessionId === id;
+    const selectedSessionId = isActive
+      ? (openTabs.length > 0 ? openTabs[openTabs.length - 1] : null)
+      : state.selectedSessionId;
+    const previousSessionId = isActive ? null : state.previousSessionId;
+    return { openTabs, selectedSessionId, previousSessionId };
+  }),
 
   loadCustomPreviewsFromDisk: async () => {
     try {

@@ -6,7 +6,8 @@ import { useAgentStore, resolveAgentId, getAgentDepth } from '../stores/agentSto
 import { useCommandStore } from '../stores/commandStore';
 import { useFileStore } from '../stores/fileStore';
 import { bridge } from '../lib/tauri-bridge';
-import { envFingerprint, resolveModelForProvider, spawnConfigHash, getAutoCompactThreshold } from '../lib/api-provider';
+import { envFingerprint, resolveModelForProvider, spawnConfigHash, getAutoCompactThreshold, fullContextTokens } from '../lib/api-provider';
+import { resolveCostUsd } from '../lib/model-pricing';
 import { buildApiRetryStatus } from '../lib/api-retry';
 import { useProviderStore } from '../stores/providerStore';
 import { t } from '../lib/i18n';
@@ -53,6 +54,23 @@ export function formatErrorForUser(raw: string): string {
   const match = ERROR_CATEGORIES.find((c) => c.pattern.test(raw));
   const friendly = match ? t(match.i18nKey) : t('error.genericFallback');
   return `${friendly}\n\n<details>\n<summary>${t('error.showDetails')}</summary>\n\n\`\`\`\n${raw}\n\`\`\`\n\n</details>`;
+}
+
+/** Mark a session as needing attention (red flashing dot in the sidebar) and,
+ *  when the window is unfocused, fire a desktop notification. Used when a
+ *  permission request is waiting for the user. */
+function notifyPermissionNeeded(tabId: string, toolName: string): void {
+  useSessionStore.getState().setAttention(tabId, true);
+  if (document.hasFocus()) return;
+  if (!('Notification' in window)) return;
+  const body = `${t('notification.permissionNeeded')} · ${toolName}`;
+  if (Notification.permission === 'granted') {
+    new Notification('TOKENICODE', { body });
+  } else if (Notification.permission === 'default') {
+    Notification.requestPermission().then((perm) => {
+      if (perm === 'granted') new Notification('TOKENICODE', { body });
+    }).catch(() => {});
+  }
 }
 
 /** S18 (v3 §4.3): allowlist of CLI-internal placeholder result strings that
@@ -297,6 +315,61 @@ function shouldCreateStreamingToolPlaceholder(toolName: string | undefined) {
       && toolName !== 'SendMessage'
       && toolName !== 'AskUserQuestion',
   );
+}
+
+/** Skill slugs invoked in the current turn, keyed by tabId. Accumulated as the
+ *  model calls the Skill tool, then attached to the assistant's reply so the
+ *  user can tell which skills actually ran (vs. merely being attached). */
+const usedSkillsByTab = new Map<string, string[]>();
+
+/** Resolve the skill slug from a tool_use block, if it is a skill invocation.
+ *  Claude Code invokes skills via the generic "Skill" tool (`{ skill: "<slug>" }`);
+ *  some CLI builds expose skills as tools named by their slug directly, so we
+ *  match both. Returns the slug, or null when the block is not a skill. */
+function detectSkillInvocation(block: any): string | null {
+  if (!block || block.type !== 'tool_use' || !block.name) return null;
+  if (block.name === 'Skill') {
+    // Canonical input shape is `{ skill: "<slug>" }`; tolerate alternate keys
+    // some CLI builds emit (slug / name).
+    const slug = block.input?.skill ?? block.input?.slug ?? block.input?.name;
+    return typeof slug === 'string' && slug.trim() ? slug.trim() : null;
+  }
+  const commands = useCommandStore.getState().commands;
+  const skillSlugs = new Set(
+    commands
+      .filter((c) => c.category === 'skill')
+      .map((c) => c.name.replace(/^\//, '')),
+  );
+  return skillSlugs.has(block.name) ? block.name : null;
+}
+
+/** Append a gray per-turn consumption footer showing this turn's token usage
+ *  (input/output) plus the cumulative session cost from the CLI's authoritative
+ *  `total_cost_usd`. Skipped for failed/aborted turns and when there's no
+ *  measurable usage. Uses a deterministic id keyed on the result UUID so
+ *  re-delivered `result` events de-duplicate instead of double-posting. */
+function addTurnCostFooter(
+  tabId: string,
+  opts: {
+    uuid?: string;
+    success: boolean;
+    inputTokens: number;
+    outputTokens: number;
+    totalCostUsd?: number | null;
+  },
+) {
+  if (!opts.success) return;
+  if (!opts.inputTokens && !opts.outputTokens) return;
+  useChatStore.getState().addMessage(tabId, {
+    id: opts.uuid ? `cost_${opts.uuid}` : generateMessageId(),
+    role: 'assistant',
+    type: 'cost',
+    content: '',
+    turnInputTokens: opts.inputTokens,
+    turnOutputTokens: opts.outputTokens,
+    costUsd: typeof opts.totalCostUsd === 'number' ? opts.totalCostUsd : undefined,
+    timestamp: Date.now(),
+  });
 }
 
 function shouldRenderThinkingForTab(tabId: string) {
@@ -901,12 +974,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           }
         }
         // Track tokens in background sessions (per-turn + cumulative total)
-        if (evt.type === 'message_start' && evt.message?.usage?.input_tokens) {
+        if (evt.type === 'message_start' && evt.message?.usage) {
           const bgTab = store.getTab(tabId);
-          const delta = evt.message.usage.input_tokens;
+          const delta = evt.message.usage.input_tokens || 0;
           store.setSessionMeta(tabId, {
             inputTokens: (bgTab?.sessionMeta.inputTokens || 0) + delta,
             totalInputTokens: (bgTab?.sessionMeta.totalInputTokens || 0) + delta,
+            contextTokens: fullContextTokens(evt.message.usage),
           });
         }
         if (evt.type === 'message_delta' && evt.usage?.output_tokens) {
@@ -985,8 +1059,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               content: block.text, timestamp: Date.now(),
             });
           } else if (block.type === 'tool_use') {
-            // Code mode: suppress EnterPlanMode/ExitPlanMode (transparent to user)
-            if (getEffectiveMode(store.getTab(tabId)?.sessionMeta) === 'code'
+            // Auto mode: suppress EnterPlanMode/ExitPlanMode (transparent to user)
+            if (getEffectiveMode(store.getTab(tabId)?.sessionMeta) === 'auto'
                 && (block.name === 'EnterPlanMode' || block.name === 'ExitPlanMode')) {
               if (block.name === 'ExitPlanMode') exitPlanModeSeenRef.current = true;
               continue;
@@ -1154,6 +1228,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
+        // Turn finished — drop any un-attached skill usage (e.g. interrupted
+        // before a final text block) so it can't leak into the next turn.
+        usedSkillsByTab.delete(tabId);
         // Capture stopping state BEFORE status update — needed for drain guard below
         const bgWasStopping = store.getTab(tabId)?.sessionStatus === 'stopping';
         const bgResultTab = store.getTab(tabId);
@@ -1192,10 +1269,18 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           stdinId: bgResultStdinId,
         });
 
+        // Resolve this turn's input/output tokens once, and compute the
+        // authoritative cost — for non-Claude (ccswitch-routed) models from the
+        // actual model's price, otherwise the CLI's Claude-priced total.
+        const bgResultInput = msg.usage?.input_tokens || 0;
+        const bgResultOutput = msg.usage?.output_tokens || 0;
+        const bgSpawnedModel = store.getTab(tabId)?.sessionMeta.spawnedModel;
+        const bgResolvedCost = resolveCostUsd(bgSpawnedModel, bgResultInput, bgResultOutput, msg.total_cost_usd);
+
         // Clear pending command on result (e.g. /compact completing on background tab)
         completePendingCommand(tabId, {
-          costSummary: msg.total_cost_usd != null ? {
-            cost: `$${msg.total_cost_usd?.toFixed(4) || '0'}`,
+          costSummary: bgResolvedCost != null ? {
+            cost: `$${bgResolvedCost.toFixed(4)}`,
             duration: msg.duration_ms ? `${(msg.duration_ms / 1000).toFixed(1)}s` : '',
             turns: msg.num_turns ?? '',
             input: msg.usage?.input_tokens?.toLocaleString() ?? '',
@@ -1206,21 +1291,31 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         {
           const bgTab = store.getTab(tabId);
           const prevMeta = bgTab?.sessionMeta;
-          const resultInput = msg.usage?.input_tokens || 0;
-          const resultOutput = msg.usage?.output_tokens || 0;
+          const resultInput = bgResultInput;
+          const resultOutput = bgResultOutput;
           const streamedInput = prevMeta?.inputTokens || 0;
           const streamedOutput = prevMeta?.outputTokens || 0;
+          const resolvedCost = bgResolvedCost;
           store.setSessionMeta(tabId, {
-            cost: msg.total_cost_usd,
+            cost: resolvedCost ?? undefined,
             duration: msg.duration_ms,
             turns: msg.num_turns,
             inputTokens: resultInput,
             outputTokens: resultOutput,
+            contextTokens: fullContextTokens(msg.usage),
             totalInputTokens: (prevMeta?.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (prevMeta?.totalOutputTokens || 0) + (resultOutput - streamedOutput),
             turnStartTime: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
+          });
+          // Per-turn consumption annotation (workbuddy-style gray footer).
+          addTurnCostFooter(tabId, {
+            uuid: msg.uuid,
+            success: msg.subtype === 'success',
+            inputTokens: resultInput,
+            outputTokens: resultOutput,
+            totalCostUsd: resolvedCost,
           });
         }
         if (typeof msg.result === 'string' && msg.result && !isCliPlaceholder(msg.result)) {
@@ -1271,6 +1366,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               console.warn('[TC:bg] Config changed mid-queue — pending messages restored to draft');
             } else {
               const bgCombined = bgAllPending.map((p) => p.text).join('\n\n');
+              const bgCombinedSkills = [...new Set(bgAllPending.flatMap((p) => p.attachedSkills ?? []))];
+              const bgCombinedAttachments = bgAllPending.flatMap((p) => p.attachments ?? []);
+              const bgImagePaths = bgCombinedAttachments
+                .filter((file) => file.isImage && ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type))
+                .map((file) => file.path);
               store.clearPendingMessages(tabId);
               store.addMessage(tabId, {
                 id: generateMessageId(),
@@ -1278,11 +1378,21 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 type: 'text',
                 content: bgCombined,
                 timestamp: Date.now(),
+                attachments: bgCombinedAttachments.length > 0
+                  ? bgCombinedAttachments.map(({ name, path, isImage, preview }) => ({ name, path, isImage, preview }))
+                  : undefined,
+                attachedSkills: bgCombinedSkills.length ? bgCombinedSkills : undefined,
               });
               store.setSessionStatus(tabId, 'running');
-              store.setSessionMeta(tabId, { turnStartTime: Date.now(), lastProgressAt: Date.now(), inputTokens: 0, outputTokens: 0 });
+              store.setSessionMeta(tabId, {
+                turnStartTime: Date.now(),
+                lastProgressAt: Date.now(),
+                inputTokens: 0,
+                outputTokens: 0,
+                pendingTurnAttachments: bgCombinedAttachments.length > 0 ? bgCombinedAttachments : undefined,
+              });
               store.setActivityStatus(tabId, { phase: 'thinking' });
-              bridge.sendStdin(bgFlushStdinId, bgCombined).catch((err) => {
+              bridge.sendStdin(bgFlushStdinId, bgCombined, bgImagePaths).catch((err) => {
                 console.error('[TC:bg] Failed to send pending messages:', err);
                 const bgDraft = store.getTab(tabId)?.inputDraft ?? '';
                 store.setInputDraft(tabId, bgDraft ? `${bgDraft}\n\n${bgCombined}` : bgCombined);
@@ -1595,6 +1705,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             timestamp: Date.now(),
           });
           chatStore.setActivityStatus(tabId, { phase: 'awaiting' });
+          notifyPermissionNeeded(tabId, msg.tool_name);
         }
         return;
       }
@@ -1657,6 +1768,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           owner: ownerStdinId ? { tabId, stdinId: ownerStdinId } : undefined,
         });
         chatStore.setActivityStatus(tabId, { phase: 'awaiting' });
+        notifyPermissionNeeded(tabId, msg.tool_name);
         return;
       }
 
@@ -1689,6 +1801,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         },
       });
       chatStore.setActivityStatus(tabId, { phase: 'awaiting' });
+      notifyPermissionNeeded(tabId, msg.tool_name);
       return;
     }
 
@@ -1886,12 +1999,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
 
         // Track input tokens from message_start (per-turn + cumulative total)
-        if (evt.type === 'message_start' && evt.message?.usage?.input_tokens) {
+        if (evt.type === 'message_start' && evt.message?.usage) {
           const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
-          const delta = evt.message.usage.input_tokens;
+          const delta = evt.message.usage.input_tokens || 0;
           setSessionMeta({
             inputTokens: (meta.inputTokens || 0) + delta,
             totalInputTokens: (meta.totalInputTokens || 0) + delta,
+            contextTokens: fullContextTokens(evt.message.usage),
           });
         }
 
@@ -2016,6 +2130,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             // Use msg.uuid + block index as stable ID so re-delivered
             // messages de-duplicate correctly in the store.
             const textId = msg.uuid ? `${msg.uuid}_text_${blockIdx}` : generateMessageId();
+            // Surface which skills actually ran on this reply (Part B of the
+            // "show skill usage" request). Skills are invoked before the final
+            // answer, so the accumulated set is attached here and cleared.
+            const textUsedSkills = usedSkillsByTab.get(tabId);
             addMessage({
               id: textId,
               role: 'assistant',
@@ -2023,11 +2141,21 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               content: block.text,
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
+              usedSkills: textUsedSkills && textUsedSkills.length ? [...textUsedSkills] : undefined,
             });
+            if (textUsedSkills) usedSkillsByTab.delete(tabId);
           } else if (block.type === 'tool_use') {
-            // Code mode: EnterPlanMode/ExitPlanMode are transparent — CLI handles internally.
+            // Record skill invocations so the reply can be annotated with which
+            // skills were actually used (Part B of the "show skill usage" request).
+            const skillSlug = detectSkillInvocation(block);
+            if (skillSlug) {
+              const used = usedSkillsByTab.get(tabId) ?? [];
+              if (!used.includes(skillSlug)) used.push(skillSlug);
+              usedSkillsByTab.set(tabId, used);
+            }
+            // Auto mode: EnterPlanMode/ExitPlanMode are transparent — CLI handles internally.
             // Don't show tool cards; track ExitPlanMode for auto-restart if CLI exits.
-            if (getEffectiveMode(useChatStore.getState().getTab(tabId)?.sessionMeta) === 'code'
+            if (getEffectiveMode(useChatStore.getState().getTab(tabId)?.sessionMeta) === 'auto'
                 && (block.name === 'EnterPlanMode' || block.name === 'ExitPlanMode')) {
               if (block.name === 'ExitPlanMode') exitPlanModeSeenRef.current = true;
               continue;
@@ -2348,6 +2476,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
 
       case 'result': {
+        // Turn finished — drop any un-attached skill usage (e.g. interrupted
+        // before a final text block) so it can't leak into the next turn.
+        usedSkillsByTab.delete(tabId);
         // Capture stopping state BEFORE any status updates — needed for drain guard later
         const fgResultTab = useChatStore.getState().getTab(tabId);
         const fgWasStopping = fgResultTab?.sessionStatus === 'stopping';
@@ -2471,8 +2602,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 if (!cwd) return;
                 const selectedModel = useSettingsStore.getState().selectedModel;
                 const sessionMode = useSettingsStore.getState().sessionMode;
-                const model = resolveModelForProvider(selectedModel);
                 const providerId = useProviderStore.getState().activeProviderId || '';
+                // Native mode (no TOKENICODE-owned provider): leave model undefined so
+                // the CLI reads its shared config (~/.claude/settings.json).
+                const model = providerId ? resolveModelForProvider(selectedModel) : undefined;
                 const permissionMode = mapSessionModeToPermissionMode(sessionMode);
 
                 setSessionStatus('running');
@@ -2549,10 +2682,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           }
         }
 
-        // Code mode: Auto-restart when ExitPlanMode caused CLI exit.
+        // Auto mode: Auto-restart when ExitPlanMode caused CLI exit.
         // In stream-json mode, ExitPlanMode is treated as a permission denial,
         // causing the CLI to exit. Silently restart with --resume to continue.
-        if (exitPlanModeSeenRef.current && getEffectiveMode(useChatStore.getState().getTab(tabId)?.sessionMeta) === 'code'
+        if (exitPlanModeSeenRef.current && getEffectiveMode(useChatStore.getState().getTab(tabId)?.sessionMeta) === 'auto'
             && msg.subtype !== 'success') {
           exitPlanModeSeenRef.current = false;
           console.log('[TOKENICODE] Code mode ExitPlanMode exit detected — auto-restarting with --resume');
@@ -2603,7 +2736,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // If we have cost metadata AND a pending slash command (e.g., /compact, /cost),
         // inject cost summary into the processing card instead of creating a separate message.
         if (msg.total_cost_usd != null && pendingCmdMsgId) {
-          const cost = msg.total_cost_usd?.toFixed(4) ?? '—';
+          const cmdResolvedCost = resolveCostUsd(
+            useChatStore.getState().getTab(tabId)?.sessionMeta.spawnedModel,
+            msg.usage?.input_tokens || 0,
+            msg.usage?.output_tokens || 0,
+            msg.total_cost_usd,
+          );
+          const cost = cmdResolvedCost != null ? cmdResolvedCost.toFixed(4) : '—';
           const duration = msg.duration_ms
             ? `${(msg.duration_ms / 1000).toFixed(1)}s`
             : '—';
@@ -2690,17 +2829,29 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const resultOutput = msg.usage?.output_tokens || 0;
           const streamedInput = meta.inputTokens || 0;
           const streamedOutput = meta.outputTokens || 0;
+          // Cost: for non-Claude (ccswitch-routed) models compute from the
+          // actual model's price; otherwise trust the CLI's Claude-priced total.
+          const resolvedCost = resolveCostUsd(meta.spawnedModel, resultInput, resultOutput, msg.total_cost_usd);
           setSessionMeta({
-            cost: msg.total_cost_usd,
+            cost: resolvedCost ?? undefined,
             duration: msg.duration_ms,
             turns: msg.num_turns,
             inputTokens: resultInput,
             outputTokens: resultOutput,
+            contextTokens: fullContextTokens(msg.usage),
             totalInputTokens: (meta.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (meta.totalOutputTokens || 0) + (resultOutput - streamedOutput),
             turnStartTime: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
+          });
+          // Per-turn consumption annotation (workbuddy-style gray footer).
+          addTurnCostFooter(tabId, {
+            uuid: msg.uuid,
+            success: msg.subtype === 'success',
+            inputTokens: resultInput,
+            outputTokens: resultOutput,
+            totalCostUsd: resolvedCost,
           });
         }
         agentActions.completeAll(
@@ -2820,7 +2971,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             if (hashMismatch || stdinMismatch) {
               const draftBeforeRestore = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
               const attachmentsBeforeRestore = useChatStore.getState().getTab(tabId)?.pendingAttachments ?? [];
-              const prefixBeforeRestore = useCommandStore.getState().activePrefix;
+              const prefixBeforeRestore = useCommandStore.getState().activePrefixes;
               useChatStore.getState().restorePendingQueueToDraft(tabId);
               const restoredDraft = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
               if (useSessionStore.getState().selectedSessionId === tabId) {
@@ -2828,7 +2979,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 if (
                   draftBeforeRestore.trim().length === 0
                   && attachmentsBeforeRestore.length === 0
-                  && !prefixBeforeRestore
+                  && prefixBeforeRestore.length === 0
                   && restoredDraft.trim().length > 0
                 ) {
                   requestAnimationFrame(() => handleSubmitRef.current());
@@ -2837,6 +2988,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               console.warn('[TC] Config changed mid-queue — pending messages retried under current config');
             } else {
               const nextMsg = allPending.map((p) => p.text).join('\n\n');
+              const combinedSkills = [...new Set(allPending.flatMap((p) => p.attachedSkills ?? []))];
+              const combinedAttachments = allPending.flatMap((p) => p.attachments ?? []);
+              const imagePaths = combinedAttachments
+                .filter((file) => file.isImage && ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type))
+                .map((file) => file.path);
               useChatStore.getState().clearPendingMessages(tabId);
               const pendingTurnMessageId = generateMessageId();
 
@@ -2849,6 +3005,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 type: 'text',
                 content: nextMsg,
                 timestamp: Date.now(),
+                attachments: combinedAttachments.length > 0
+                  ? combinedAttachments.map(({ name, path, isImage, preview }) => ({ name, path, isImage, preview }))
+                  : undefined,
+                attachedSkills: combinedSkills.length ? combinedSkills : undefined,
               });
               const nextTurnStartedAt = Date.now();
               setSessionStatus('running');
@@ -2860,7 +3020,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 teardownReason: undefined,
                 pendingTurnMessageId,
                 pendingTurnInput: nextMsg,
-                pendingTurnAttachments: undefined,
+                pendingTurnAttachments: combinedAttachments.length > 0 ? combinedAttachments : undefined,
               });
               setActivityStatus({ phase: 'thinking' });
               agentActions.clearAgents();
@@ -2872,7 +3032,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 startTime: Date.now(),
                 isMain: true,
               });
-              bridge.sendStdin(flushStdinId, nextMsg).catch((err) => {
+              bridge.sendStdin(flushStdinId, nextMsg, imagePaths).catch((err) => {
                 console.error('[TC] Failed to send pending messages:', err);
                 const draft = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
                 useChatStore.getState().setInputDraft(tabId, draft ? `${draft}\n\n${nextMsg}` : nextMsg);
@@ -2924,6 +3084,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             break;
           }
         }
+
+        // The process is gone — clear any pending-attention flag for this tab.
+        useSessionStore.getState().setAttention(tabId, false);
 
         // If the session was running and no assistant messages were received,
         // the process failed at startup. Show the last stderr error.

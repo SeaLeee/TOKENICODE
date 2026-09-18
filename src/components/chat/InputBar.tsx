@@ -3,7 +3,8 @@ import { useChatStore, useActiveTab, getActiveTabState, generateMessageId, isSes
 import { useSettingsStore, MODEL_OPTIONS, mapSessionModeToPermissionMode, setSessionModeLocal, type ThinkingLevel } from '../../stores/settingsStore';
 import { bridge, type UnifiedCommand } from '../../lib/tauri-bridge';
 import { ModelSelector } from './ModelSelector';
-// import { ModeSelector } from './ModeSelector';
+import { ModeSelector } from './ModeSelector';
+import { ContextMeter } from './ContextMeter';
 import { FileUploadChips } from './FileUploadChips';
 import { RewindPanel } from './RewindPanel';
 import { useFileAttachments } from '../../hooks/useFileAttachments';
@@ -13,7 +14,9 @@ import { useAgentStore } from '../../stores/agentStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useT } from '../../lib/i18n';
 import { SlashCommandPopover, getFilteredCommandList } from './SlashCommandPopover';
+import { SkillPicker } from './SkillPicker';
 import { useCommandStore } from '../../stores/commandStore';
+import { suggestSkills, suggestSkillsWithAi, type SkillSuggestion } from '../../lib/skill-suggestion';
 import { envFingerprint, resolveModelForProvider, resolveModelOrError, spawnConfigHash } from '../../lib/api-provider';
 import { useProviderStore } from '../../stores/providerStore';
 import { PROVIDER_PRESETS } from '../../lib/provider-presets';
@@ -50,6 +53,18 @@ function buildInterruptedContinuationPrompt(interruptedAssistantText: string, ne
   ].join('\n\n');
 }
 
+const VISION_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function isVisionImageAttachment(file: FileAttachment): boolean {
+  return file.isImage && VISION_IMAGE_TYPES.has(file.type);
+}
+
+function visionImagePaths(files: FileAttachment[]): string[] {
+  return files
+    .filter(isVisionImageAttachment)
+    .map((file) => file.path);
+}
+
 function hasResumableConversationEvidence(messages: ChatMessage[]): boolean {
   return messages.some(
     (m) =>
@@ -57,6 +72,28 @@ function hasResumableConversationEvidence(messages: ChatMessage[]): boolean {
       && (m.type === 'text' || m.type === 'tool_use' || m.type === 'thinking')
       && m.content.trim().length > 0,
   );
+}
+
+/** True when the caret sits on the first visual line of the editor (within the
+ *  first paragraph and with no line break before it). Up/Down recall history only
+ *  here — elsewhere they keep moving the caret within a multi-line draft. */
+function isCaretOnFirstLine(editor: any): boolean {
+  if (!editor) return true;
+  const { selection, doc } = editor.state;
+  if (!selection.empty) return false;
+  const $from = selection.$from;
+  // Count line breaks before the caret: hardBreak nodes (Shift+Enter) and any
+  // block node that starts after position 0 (a paragraph boundary). If any are
+  // present, the caret is on a later line.
+  let lineBreaks = 0;
+  doc.nodesBetween(0, $from.pos, (node: any, pos: number) => {
+    if (node.type?.name === 'hardBreak' || (node.isBlock && pos > 0)) {
+      lineBreaks += 1;
+      return false;
+    }
+    return true;
+  });
+  return lineBreaks === 0;
 }
 
 /** Thinking effort level selector dropdown for the toolbar */
@@ -200,12 +237,22 @@ export function InputBar() {
   const textareaRef = useRef<TiptapEditorHandle>(null);
   const latestFilesRef = useRef<FileAttachment[]>([]);
   const previousSessionIdRef = useRef<string | null>(selectedSessionId);
+  /** Up/Down history navigation. `-1` = not navigating; the draft that was on
+   *  screen before navigation is saved so Down can restore it. */
+  const historyIndexRef = useRef(-1);
+  const historyDraftRef = useRef('');
   /** Sync both the Zustand store and the tiptap editor.
    *  Use this for all programmatic input changes (clear, set, etc.).
    *  The editor's onUpdate callback uses setInput directly to avoid circular updates. */
   const setInputSync = useCallback((text: string) => {
     setInput(text);
     textareaRef.current?.setText(text);
+  }, [setInput]);
+  /** Like setInputSync, but places the caret at the start of the recalled text so
+   *  Up/Down history navigation keeps working even on multi-line entries. */
+  const setHistoryInput = useCallback((text: string) => {
+    setInput(text);
+    textareaRef.current?.setText(text, 'start');
   }, [setInput]);
   const captureLiveDraftSnapshot = useCallback((tabId: string) => {
     if (!selectedSessionId || tabId !== selectedSessionId) return null;
@@ -233,6 +280,12 @@ export function InputBar() {
     }
     previousSessionIdRef.current = selectedSessionId;
   }, [selectedSessionId, setInputDraftStore]);
+
+  // Reset history navigation when switching sessions — each session has its own history.
+  useEffect(() => {
+    historyIndexRef.current = -1;
+    historyDraftRef.current = '';
+  }, [selectedSessionId]);
 
   // Restore input text from store when session switches (restoreFromCache → inputDraft change)
   const prevEditorSyncRef = useRef<{ tabId: string | null; inputDraft: string } | null>(null);
@@ -275,11 +328,11 @@ export function InputBar() {
     // If CLI is still alive (e.g., Bypass auto-accepted ExitPlanMode),
     // just dismiss the card — no restart needed.
     if (meta.stdinId && status === 'running') {
-      if (useSettingsStore.getState().sessionMode !== 'code') {
-        setSessionModeLocal('code');
+      if (useSettingsStore.getState().sessionMode !== 'auto') {
+        setSessionModeLocal('auto');
       }
       if (meta.snapshotMode === 'plan') {
-        useChatStore.getState().setSessionMeta(tabId, { snapshotMode: 'code' });
+        useChatStore.getState().setSessionMeta(tabId, { snapshotMode: 'auto' });
       }
       useChatStore.getState().setActivityStatus(tabId, { phase: 'thinking' });
       return;
@@ -289,7 +342,7 @@ export function InputBar() {
     // Plan mode: switch to Code mode for execution.
     // Bypass mode: stay in Bypass (no mode switch needed).
     if (currentMode === 'plan') {
-      useSettingsStore.getState().setSessionMode('code');
+      useSettingsStore.getState().setSessionMode('auto');
     }
 
     // Clean up dead CLI process via lifecycle module
@@ -373,14 +426,71 @@ export function InputBar() {
   const [slashVisible, setSlashVisible] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
   const slashCommands = useCommandStore((s) => s.commands);
-  const activePrefix = useCommandStore((s) => s.activePrefix);
+  const activePrefixes = useCommandStore((s) => s.activePrefixes);
 
-  // Focus input when activePrefix is set externally (e.g. from SkillsPanel "Use in Input")
+  // Skill auto-suggestion state — populated by a debounce effect on `input`.
+  const [skillSuggestions, setSkillSuggestions] = useState<SkillSuggestion[]>([]);
+  const [aiSuggesting, setAiSuggesting] = useState(false);
+  const skillAutoSuggest = useSettingsStore((s) => s.skillAutoSuggest);
+  const skillAiEnhance = useSettingsStore((s) => s.skillAiEnhance);
+
+  // Debounced skill suggestion: local keyword scoring (300ms), or AI-enhanced
+  // semantic matching (800ms) when the setting is on and a provider is active.
   useEffect(() => {
-    if (activePrefix) {
+    const q = input.trim();
+    if (!skillAutoSuggest || !q || slashVisible) {
+      setSkillSuggestions([]);
+      setAiSuggesting(false);
+      return;
+    }
+    const skills = useCommandStore.getState().commands;
+    const exclude = new Set(useCommandStore.getState().activePrefixes.map((p) => p.name));
+    const applyLocal = () => {
+      setSkillSuggestions(suggestSkills(q, skills, { excludeNames: exclude }));
+      setAiSuggesting(false);
+    };
+    const useAi = skillAiEnhance && Boolean(useProviderStore.getState().getActive());
+    const delay = useAi ? 800 : 300;
+    const timer = setTimeout(async () => {
+      if (useAi) {
+        setAiSuggesting(true);
+        const ai = await suggestSkillsWithAi(q, skills);
+        if (ai.length > 0) {
+          setSkillSuggestions(ai);
+          setAiSuggesting(false);
+        } else {
+          // No AI match (or call failed / returned []) → fall back to local.
+          applyLocal();
+        }
+      } else {
+        applyLocal();
+      }
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [input, slashVisible, skillAutoSuggest, skillAiEnhance, activePrefixes]);
+
+  // Dedicated "add skill" picker state (separate from the slash-command popover)
+  const [skillPickerVisible, setSkillPickerVisible] = useState(false);
+  const skillPickerRef = useRef<HTMLDivElement>(null);
+
+  // Close the skill picker when clicking outside its container
+  useEffect(() => {
+    if (!skillPickerVisible) return;
+    const onDown = (e: MouseEvent) => {
+      if (skillPickerRef.current && !skillPickerRef.current.contains(e.target as Node)) {
+        setSkillPickerVisible(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [skillPickerVisible]);
+
+  // Focus input when activePrefixes are set externally (e.g. from SkillsPanel "Use in Input")
+  useEffect(() => {
+    if (activePrefixes.length) {
       textareaRef.current?.focus();
     }
-  }, [activePrefix]);
+  }, [activePrefixes]);
 
   // Rewind state
   const [showRewindPanel, setShowRewindPanel] = useState(false);
@@ -411,10 +521,12 @@ export function InputBar() {
   // Drag state (file drop)
   const [isDragging, setIsDragging] = useState(false);
 
-  // Fetch slash commands when working directory changes
+  const customSkillDirs = useSettingsStore((s) => s.customSkillDirs);
+
+  // Fetch slash commands when working directory or custom skill dirs change
   useEffect(() => {
     useCommandStore.getState().fetchCommands(workingDirectory || undefined);
-  }, [workingDirectory]);
+  }, [workingDirectory, customSkillDirs]);
 
   // Shared busy state for follow-up placeholder / stop controls / selector lock.
   // We keep a stricter editor lock for `stopping` below so the user can't
@@ -422,13 +534,11 @@ export function InputBar() {
   const isRunning = isSessionBusy(sessionStatus);
   const isStopping = sessionStatus === 'stopping';
   const isAwaiting = isRunning && activityPhase === 'awaiting';
-  const inputPlaceholder = activePrefix
-    ? t('input.prefixPlaceholder')
-    : isStopping
-      ? t('input.stoppingPlaceholder')
-      : isRunning
-        ? t('input.followUp')
-        : t('input.placeholder');
+  const inputPlaceholder = isStopping
+    ? t('input.stoppingPlaceholder')
+    : isRunning
+      ? t('input.followUp')
+      : t('input.placeholder');
 
   // Whether this is a follow-up (session already has a CLI session ID)
   const hasActiveSession = sessionStatus !== 'idle';
@@ -437,7 +547,7 @@ export function InputBar() {
   // Relaxed: detect "/" at start of first line, keep popover open even after spaces
   const detectSlashCommand = useCallback((text: string) => {
     const firstLine = text.split('\n')[0];
-    if (firstLine.startsWith('/') && !activePrefix) {
+    if (firstLine.startsWith('/') && !activePrefixes.length) {
       const query = firstLine.slice(1); // strip leading "/"
       setSlashQuery(query);
       setSlashVisible(true);
@@ -445,7 +555,7 @@ export function InputBar() {
     } else {
       setSlashVisible(false);
     }
-  }, [activePrefix]);
+  }, [activePrefixes]);
 
   // Ref to always point to the latest handleSubmit (avoids stale closure)
   const handleSubmitRef = useRef<() => void>(() => {});
@@ -513,13 +623,15 @@ export function InputBar() {
         useSettingsStore.getState().setSessionMode('plan');
         feedback('mode', t('cmd.switchedToPlan'), { mode: 'plan', icon: '📋' });
         return;
-      case 'code':
-        useSettingsStore.getState().setSessionMode('code');
-        feedback('mode', t('cmd.switchedToCode'), { mode: 'code', icon: '⚡' });
+      case 'auto':
+      case 'code': // legacy alias for the pre-rename slash command
+      case 'bypass': // legacy alias — old "bypass" meant fully-auto, now 'auto'
+        useSettingsStore.getState().setSessionMode('auto');
+        feedback('mode', t('cmd.switchedToAuto'), { mode: 'auto', icon: '⚡' });
         return;
-      case 'bypass':
-        useSettingsStore.getState().setSessionMode('bypass');
-        feedback('mode', t('cmd.switchedToBypass'), { mode: 'bypass', icon: '🔓' });
+      case 'edit-auto':
+        useSettingsStore.getState().setSessionMode('editAuto');
+        feedback('mode', t('cmd.switchedToEditAuto'), { mode: 'editAuto', icon: '📝' });
         return;
 
       // --- Session management ---
@@ -695,18 +807,26 @@ export function InputBar() {
     if (cmd.immediate) {
       if (cmd.has_args) {
         // Immediate + has_args: show prefix chip so user can type the argument
-        useCommandStore.getState().setActivePrefix(cmd);
+        useCommandStore.getState().addPrefix(cmd);
         textareaRef.current?.focus();
       } else {
         // Immediate execution: send command via stdin or as first message
         executeImmediateCommand(cmd.name);
       }
     } else {
-      // Deferred: set as immutable prefix chip
-      useCommandStore.getState().setActivePrefix(cmd);
+      // Deferred: attach as a prefix chip (skills can stack)
+      useCommandStore.getState().addPrefix(cmd);
       textareaRef.current?.focus();
     }
   }, [executeImmediateCommand]);
+
+  // --- Skill picker selection (attaches the prefix chip WITHOUT clearing input,
+  //      so the user can add a skill at any point and keep what they've typed) ---
+  const handleSkillPick = useCallback((skill: UnifiedCommand) => {
+    setSkillPickerVisible(false);
+    useCommandStore.getState().addPrefix(skill);
+    textareaRef.current?.focus();
+  }, []);
 
   // --- Submit ---
   const handleSubmit = useCallback(async () => {
@@ -725,7 +845,7 @@ export function InputBar() {
     const pendingPlanReview = tabState.messages.find(
       (m: import('../../stores/chatStore').ChatMessage) => m.type === 'plan_review' && !m.resolved,
     );
-    if (pendingPlanReview && !text && !useCommandStore.getState().activePrefix) {
+    if (pendingPlanReview && !text && !useCommandStore.getState().activePrefixes.length) {
       const stdinId = tabState.sessionMeta.stdinId;
       const hasLivePlanSession = Boolean(stdinId && tabState.sessionStatus === 'running');
       if (!hasLivePlanSession) {
@@ -753,9 +873,9 @@ export function InputBar() {
         }
       }
       if (useSettingsStore.getState().sessionMode === 'plan') {
-        setSessionModeLocal('code');
+        setSessionModeLocal('auto');
       }
-      useChatStore.getState().setSessionMeta(tabId, { snapshotMode: 'code' });
+      useChatStore.getState().setSessionMeta(tabId, { snapshotMode: 'auto' });
       useChatStore.getState().updateMessage(tabId, pendingPlanReview.id, {
         resolved: true,
         interactionState: 'resolved',
@@ -764,15 +884,44 @@ export function InputBar() {
       return;
     }
 
-    // Prefix mode: prepend the command/skill name.
-    // clearPrefix() is deferred until after the interaction card blocking check
-    // so the visual chip survives if the submit is blocked and rawInput is restored.
-    const prefix = useCommandStore.getState().activePrefix;
-    if (prefix) {
-      text = text ? `${prefix.name} ${text}` : prefix.name;
+    // Auto-attach the top skill suggestion when enabled (setting). Uses the
+    // deterministic local scorer so behavior is predictable and free; the async
+    // AI-enhanced list is surfaced via chips, not force-attached here.
+    if (useSettingsStore.getState().skillAutoSuggest && useSettingsStore.getState().skillAutoAttach && text) {
+      const skills = useCommandStore.getState().commands;
+      const attached = new Set(useCommandStore.getState().activePrefixes.map((p) => p.name));
+      const top = suggestSkills(text, skills, { excludeNames: attached, limit: 1 })[0];
+      if (top) useCommandStore.getState().addPrefix(top.skill);
     }
 
-    if (!text) return;
+    // Prefix mode: attached skills are converted into an explicit skill-invocation
+    // directive (so the model actually calls the Skill tool) rather than a bare
+    // "/slug" token — in stream-json SDK mode the CLI does NOT expand slash
+    // commands, it relies on the model to invoke skills. Non-skill prefixes
+    // (deferred commands) keep their "/name" syntax.
+    // clearPrefixes() is deferred until after the interaction card blocking check
+    // so the visual chips survive if the submit is blocked and rawInput is restored.
+    const prefixes = useCommandStore.getState().activePrefixes;
+    // Skill slugs attached to this message — surfaced on the user bubble so the
+    // user can confirm which skills were actually sent.
+    const attachedSkills = prefixes
+      .filter((p) => p.category === 'skill')
+      .map((s) => s.name.replace(/^\//, ''));
+    if (prefixes.length) {
+      const skills = prefixes.filter((p) => p.category === 'skill');
+      const commands = prefixes.filter((p) => p.category !== 'skill');
+      const parts: string[] = [];
+      if (skills.length) {
+        parts.push(t('input.skillDirective').replace('{names}', attachedSkills.join('、')));
+      }
+      if (commands.length) {
+        parts.push(commands.map((c) => c.name).join(' '));
+      }
+      const prefixStr = parts.join(' ');
+      text = text ? `${prefixStr}\n\n${text}` : prefixStr;
+    }
+
+    if (!text && files.length === 0) return;
 
     // Intercept immediate (built-in) commands even when submitted directly
     // (e.g. user types "/help" and presses Enter without using the popover)
@@ -781,10 +930,10 @@ export function InputBar() {
       const cmdPart = parts[0].toLowerCase();
       const restText = parts.slice(1).join(' ').trim();
 
-      // Mode-switching commands: /ask, /plan, /code, /bypass
+      // Mode-switching commands: /ask, /plan, /auto, /edit-auto (/bypass = legacy 'auto')
       // If followed by text, switch mode then submit the text normally
-      const modeMap: Record<string, 'ask' | 'plan' | 'code' | 'bypass'> = {
-        '/ask': 'ask', '/plan': 'plan', '/code': 'code', '/bypass': 'bypass',
+      const modeMap: Record<string, 'ask' | 'plan' | 'auto' | 'editAuto'> = {
+        '/ask': 'ask', '/plan': 'plan', '/auto': 'auto', '/code': 'auto', '/bypass': 'auto', '/edit-auto': 'editAuto',
       };
       if (modeMap[cmdPart]) {
         useSettingsStore.getState().setSessionMode(modeMap[cmdPart]);
@@ -795,7 +944,7 @@ export function InputBar() {
           setInputSync('');
           const modeVal = modeMap[cmdPart];
           const modeKey = `cmd.switchedTo${modeVal.charAt(0).toUpperCase() + modeVal.slice(1)}` as any;
-          const iconMap: Record<string, string> = { ask: '💬', plan: '📋', code: '⚡' };
+          const iconMap: Record<string, string> = { ask: '💬', plan: '📋', auto: '⚡', editAuto: '📝' };
           addMessage(tabId, {
             id: generateMessageId(),
             role: 'system',
@@ -821,9 +970,12 @@ export function InputBar() {
       }
     }
 
-    // Append file paths if there are attachments
-    if (files.length > 0) {
-      const filePaths = files.map((f) => f.path).join('\n');
+    // Vision images are already embedded as content blocks. Repeating their
+    // paths encourages unknown third-party models to call Claude's Read tool,
+    // whose internal vision allowlist rejects them as "Unsupported Image".
+    const pathOnlyFiles = files.filter((file) => !isVisionImageAttachment(file));
+    if (pathOnlyFiles.length > 0) {
+      const filePaths = pathOnlyFiles.map((file) => file.path).join('\n');
       text = `${text}\n\n${t('input.attachedFiles')}\n${filePaths}`;
     }
 
@@ -857,24 +1009,32 @@ export function InputBar() {
       if (hasUnresolvedInteraction) {
         // Restore the text to inputDraft so the user notices the pending
         // interaction card and can answer it directly.
-        // No clearFiles/clearPrefix has run yet, so attachments and chip are intact.
+        // No clearFiles/clearPrefixes has run yet, so attachments and chips are intact.
         useChatStore.getState().setInputDraft(tabId, rawInput);
         return;
       }
       // Queueing path: clear prefix, input and files, then enqueue.
-      if (prefix) useCommandStore.getState().clearPrefix();
+      if (prefixes.length) useCommandStore.getState().clearPrefixes();
       setInputSync('');
+      historyIndexRef.current = -1;
       clearFiles();
       useChatStore.getState().addPendingMessage(tabId, text, {
-        enqueueConfigHash: spawnConfigHash(),
+        // Native CCswitch turns must return through handleSubmit after the
+        // active turn finishes so image/text turns can switch Vision/Pro.
+        enqueueConfigHash: useProviderStore.getState().activeProviderId
+          ? spawnConfigHash()
+          : '__ccswitch_turn_route__',
         enqueueStdinId: existingStdinId,
+        attachedSkills: attachedSkills.length ? attachedSkills : undefined,
+        attachments: [...files],
       });
       return;
     }
 
-    // Past all early-return checks — commit to sending. Clear prefix chip now.
-    if (prefix) useCommandStore.getState().clearPrefix();
+    // Past all early-return checks — commit to sending. Clear prefix chips now.
+    if (prefixes.length) useCommandStore.getState().clearPrefixes();
     setInputSync('');
+    historyIndexRef.current = -1;
 
     // Snapshot attachments before clearFiles wipes them — full snapshot
     // for restoration on failure, reduced snapshot for the user message.
@@ -903,6 +1063,7 @@ export function InputBar() {
         content: rawInput.trim(),
         timestamp: Date.now(),
         attachments: userMsgAttachments,
+        attachedSkills: attachedSkills.length ? attachedSkills : undefined,
       });
       pendingTurnMeta = {
         pendingTurnMessageId,
@@ -969,6 +1130,13 @@ export function InputBar() {
         return;
       }
 
+      const activeProviderId = useProviderStore.getState().activeProviderId || '';
+      const imagePaths = visionImagePaths(savedFiles);
+      const routedModel = activeProviderId
+        ? null
+        : await bridge.resolveCcswitchTurnModel(text, imagePaths);
+      let didRouteModelSwitch = false;
+
       const markTurnPending = () => {
         setSessionStatus(tabId, 'running');
         setSessionMeta(tabId, {
@@ -1006,7 +1174,6 @@ export function InputBar() {
       // stdinId exists when: (a) a pre-warmed process is waiting, or (b) follow-up in active session.
       const submitTabState = getActiveTabState();
       let stdinId = submitTabState.sessionMeta.stdinId;
-      let stdinReady = submitTabState.sessionMeta.stdinReady === true;
       let sentViaStdin = false;
 
       // Phase 2 §2.1/§2.2: unified config-mismatch check. If ANY of
@@ -1039,13 +1206,30 @@ export function InputBar() {
           // stream error handler will auto-retry without resume.
           setSessionMeta(tabId, { envFingerprint: undefined, providerSwitched: true, providerSwitchPendingText: text });
           stdinId = undefined;
-          stdinReady = false;
         } else {
+          const sessionMeta = getActiveTabState().sessionMeta;
+          const runningModel = sessionMeta.spawnedModel ?? sessionMeta.model;
+          const mustRestartForRoutedModel = routedModel !== null && (
+            (routedModel === 'deepseek-v4-flash-vision-exp' && runningModel !== routedModel)
+            || (runningModel !== undefined && runningModel !== routedModel)
+          );
+          if (mustRestartForRoutedModel) {
+            console.warn(`[TOKENICODE] Routed model changed (${runningModel ?? 'shared config'} → ${routedModel}), restarting with resume`);
+            await teardownSession(stdinId, tabId, 'switch');
+            await waitForStdinCleared(tabId, stdinId);
+            setSessionMeta(tabId, {
+              spawnedModel: undefined,
+              modelSwitched: true,
+              modelSwitchPendingText: text,
+            });
+            didRouteModelSwitch = true;
+            stdinId = undefined;
+          } else {
           // Check if model changed since this process was spawned.
           // If so, kill the stale process and fall through to spawn a new one with --resume.
           const currentModel = resolveModelForProvider(selectedModel);
           const spawnedModel = getActiveTabState().sessionMeta.spawnedModel;
-          if (spawnedModel && currentModel !== spawnedModel) {
+          if (activeProviderId && spawnedModel && currentModel !== spawnedModel) {
             const oldShort = MODEL_OPTIONS.find((m) => m.id === spawnedModel)?.short ?? spawnedModel;
             const newShort = MODEL_OPTIONS.find((m) => m.id === currentModel)?.short ?? currentModel;
             console.warn(`[TOKENICODE] Model changed (${oldShort} → ${newShort}), killing stale session`);
@@ -1056,7 +1240,6 @@ export function InputBar() {
             // Keep cliResumeId so we attempt resume (preserving context).
             setSessionMeta(tabId, { spawnedModel: undefined, modelSwitched: true, modelSwitchPendingText: text });
             stdinId = undefined;
-            stdinReady = false;
           } else {
             // Phase 2 §2.1/§2.2: catch-all config-drift check covering dimensions
             // not caught by the envFingerprint / spawnedModel gates above —
@@ -1072,23 +1255,28 @@ export function InputBar() {
               // Unlike provider/model switch, thinking-level-only changes do NOT
               // require stripping thinking blocks — signatures remain valid.
               stdinId = undefined;
-              stdinReady = false;
             } else {
               // ===== Send via stdin to existing persistent process (pre-warmed or follow-up) =====
-              if (!stdinReady) {
-                setSessionMeta(tabId, {
-                  pendingReadyMessage: { stdinId, text },
-                });
-                console.log('[TOKENICODE] pre-warm process not ready yet — holding first message until system:init');
-                return;
-              }
+              // NOTE: Do NOT gate the first message on stdinReady. Claude Code CLI 2.1.237
+              // emits system:init only AFTER the first stdin message arrives, so an
+              // empty-prompt pre-warm never becomes "ready" and gating here holds the first
+              // message forever (the "正在启动 Agent" stuck state). Send immediately; if the
+              // process has actually died, sendStdin throws and the catch below respawns.
               try {
                 markTurnThinking();
-                await bridge.sendStdin(stdinId, text);
+                await bridge.sendStdin(
+                  stdinId,
+                  text,
+                  imagePaths,
+                );
                 sentViaStdin = true;
                 // Defensive: ensure spawnedModel is always recorded after first successful stdin send
                 if (!getActiveTabState().sessionMeta.spawnedModel) {
-                  setSessionMeta(tabId, { spawnedModel: resolveModelForProvider(selectedModel) });
+                  const activeProviderId = useProviderStore.getState().activeProviderId;
+                  setSessionMeta(tabId, {
+                    // Native mode: leave undefined so the CLI's shared-config model governs.
+                    spawnedModel: activeProviderId ? resolveModelForProvider(selectedModel) : undefined,
+                  });
                 }
               } catch (stdinErr) {
                 // stdin write failed (broken pipe — process already exited).
@@ -1102,10 +1290,10 @@ export function InputBar() {
                 });
                 setActivityStatus(tabId, { phase: 'idle' });
                 stdinId = undefined;
-                stdinReady = false;
               }
             } // close spawnConfigHash-mismatch else
           } // close spawnedModel-mismatch else
+          } // close routed-model-mismatch else
         } // close envFingerprint-mismatch else
       } // close if(stdinId) outer gate
 
@@ -1146,7 +1334,7 @@ export function InputBar() {
         // Read sessionMode from store (not closure) so plan-approve → code
         // mode switch is visible even when called via rAF.
         const liveSessionMode = useSettingsStore.getState().sessionMode;
-        const didSwitchModel = getActiveTabState().sessionMeta.modelSwitched || getActiveTabState().sessionMeta.providerSwitched;
+        const didSwitchModel = didRouteModelSwitch || getActiveTabState().sessionMeta.modelSwitched || getActiveTabState().sessionMeta.providerSwitched;
         // Phase 2 §2.1: capture the spawn-time config hash BEFORE the async
         // spawn so it reflects the config that was actually used, not whatever
         // the user might change while the spawn is in flight.
@@ -1156,8 +1344,13 @@ export function InputBar() {
           stdinReady: false,
           pendingReadyMessage: undefined,
         });
+        markTurnThinking();
 
         console.log('[TOKENICODE:session] starting session', { cwd, stdinId: preGeneratedId, mode: liveSessionMode, provider: useProviderStore.getState().activeProviderId, modelSwitch: !!didSwitchModel, resumeSessionId: existingSessionId });
+
+        // Native CCswitch mode resolves the model per turn: images use Vision,
+        // while ordinary text returns to Pro.
+        const model = activeProviderId ? resolveModelForProvider(selectedModel) : (routedModel ?? undefined);
 
         // Use lifecycle module for unified spawn
         const spawnResult = await spawnSession({
@@ -1165,21 +1358,22 @@ export function InputBar() {
           stdinId: preGeneratedId,
           cwdSnapshot: cwd,
           configSnapshot: {
-            model: resolveModelForProvider(selectedModel),
-            providerId: useProviderStore.getState().activeProviderId || '',
+            model,
+            providerId: activeProviderId,
             thinkingLevel: useSettingsStore.getState().thinkingLevel,
             permissionMode: mapSessionModeToPermissionMode(liveSessionMode),
           },
           sessionModeSnapshot: liveSessionMode,
           sessionParams: {
             prompt: text,
+            image_paths: imagePaths,
             cwd,
-            model: resolveModelForProvider(selectedModel),
+            model,
             session_id: preGeneratedId,
             resume_session_id: existingSessionId || undefined,
             thinking_level: useSettingsStore.getState().thinkingLevel,
             session_mode: (liveSessionMode === 'ask' || liveSessionMode === 'plan') ? liveSessionMode : undefined,
-            provider_id: useProviderStore.getState().activeProviderId || undefined,
+            provider_id: activeProviderId || undefined,
             permission_mode: mapSessionModeToPermissionMode(liveSessionMode),
             model_switch: didSwitchModel ? true : undefined,
           },
@@ -1203,7 +1397,7 @@ export function InputBar() {
         setSessionMeta(spawnOwnerTabId, {
           sessionId: nextSessionId,
           envFingerprint: preEnvFingerprint,
-          spawnedModel: resolveModelForProvider(selectedModel),
+          spawnedModel: model,
           stdinReady: false,
           pendingReadyMessage: undefined,
           // Phase 2 §2.1: lock in the spawn-time config hash for later
@@ -1389,10 +1583,48 @@ export function InputBar() {
       }
     }
 
-    // Backspace at position 0 with empty input removes active prefix
-    if (e.key === 'Backspace' && activePrefix && (textareaRef.current?.isEmpty() ?? true)) {
+    // History recall (Up/Down) — like VSCode Claude Code / a terminal REPL.
+    // Up walks back through previously submitted inputs; Down walks forward and
+    // eventually restores the draft that was on screen before navigation began.
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      if (e.isComposing || e.keyCode === 229) return;
+      // Only recall history when the caret is on the first line — otherwise
+      // Up/Down keep moving the caret inside a multi-line draft.
+      if (!isCaretOnFirstLine(textareaRef.current?.getEditor())) return;
+      const history = getActiveTabState().messages
+        .filter((m) => m.role === 'user' && m.type === 'text' && m.content.trim().length > 0)
+        .map((m) => m.content.trim());
+      if (history.length === 0) return;
+
+      const idx = historyIndexRef.current;
+      if (e.key === 'ArrowUp') {
+        if (idx === -1) {
+          historyDraftRef.current = textareaRef.current?.getText() ?? '';
+          historyIndexRef.current = history.length - 1;
+        } else if (idx > 0) {
+          historyIndexRef.current = idx - 1;
+        }
+        e.preventDefault();
+        setHistoryInput(history[historyIndexRef.current]);
+        return true;
+      }
+      // ArrowDown
+      if (idx === -1) return; // not navigating — let the caret move normally
       e.preventDefault();
-      useCommandStore.getState().clearPrefix();
+      if (idx < history.length - 1) {
+        historyIndexRef.current = idx + 1;
+        setHistoryInput(history[historyIndexRef.current]);
+      } else {
+        historyIndexRef.current = -1;
+        setInputSync(historyDraftRef.current);
+      }
+      return true;
+    }
+
+    // Backspace at position 0 with empty input removes the last attached prefix
+    if (e.key === 'Backspace' && activePrefixes.length && (textareaRef.current?.isEmpty() ?? true)) {
+      e.preventDefault();
+      useCommandStore.getState().removePrefix(activePrefixes[activePrefixes.length - 1].name);
       return true;
     }
 
@@ -1497,10 +1729,54 @@ export function InputBar() {
           </div>
         )}
 
-        {/* Active prefix description — shown above textarea when a command is selected */}
-        {activePrefix && (
-          <div className="mb-1 px-1">
-            <span className="text-[10px] text-text-tertiary">{activePrefix.description}</span>
+        {/* Attached skills/commands — a separate chip bar above the text area so
+            typing stays a clean free-text box. */}
+        {activePrefixes.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {activePrefixes.map((p) => (
+              <span
+                key={p.name}
+                className="inline-flex items-center gap-1 px-2 py-1
+                  bg-accent/10 border border-accent/20 rounded-md
+                  text-xs text-accent font-medium font-mono whitespace-nowrap"
+              >
+                {p.name}
+                <button
+                  onClick={() => useCommandStore.getState().removePrefix(p.name)}
+                  className="hover:text-red-400 transition-smooth ml-0.5"
+                >
+                  <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
+                    stroke="currentColor" strokeWidth="1.5">
+                    <path d="M3 3l6 6M9 3l-6 6" />
+                  </svg>
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Skill suggestions — click to attach, or auto-attached on submit */}
+        {skillSuggestions.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-[10px] text-text-tertiary flex-shrink-0 mr-0.5">
+              {aiSuggesting ? t('input.skillSuggestLoading') : t('input.skillSuggestLabel')}
+            </span>
+            {skillSuggestions.map((s) => (
+              <button
+                key={s.skill.name}
+                onClick={() => useCommandStore.getState().addPrefix(s.skill)}
+                className="inline-flex items-center gap-1 px-2 py-1
+                  bg-bg-secondary border border-border-subtle rounded-md
+                  text-xs text-text-secondary hover:text-text-primary
+                  hover:border-accent/40 transition-smooth cursor-pointer"
+              >
+                <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"
+                  className="text-accent/70 flex-shrink-0">
+                  <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+                </svg>
+                {s.skill.name}
+              </button>
+            ))}
           </div>
         )}
 
@@ -1525,26 +1801,8 @@ export function InputBar() {
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
-          {/* Prefix chip + textarea inline */}
+          {/* Free-text editor (skills/commands attach as chips above, not inline) */}
           <div className="flex-1 flex items-start gap-0 min-w-0">
-            {activePrefix && (
-              <div className="flex-shrink-0 flex items-center h-[24px] mt-[2px]">
-                <span className="inline-flex items-center gap-1 px-2 py-0.5
-                  bg-accent/10 border border-accent/20 rounded-md
-                  text-xs text-accent font-medium font-mono whitespace-nowrap mr-1.5">
-                  {activePrefix.name}
-                  <button
-                    onClick={() => useCommandStore.getState().clearPrefix()}
-                    className="hover:text-red-400 transition-smooth ml-0.5"
-                  >
-                    <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
-                      stroke="currentColor" strokeWidth="1.5">
-                      <path d="M3 3l6 6M9 3l-6 6" />
-                    </svg>
-                  </button>
-                </span>
-              </div>
-            )}
             <TiptapEditor
               ref={textareaRef}
               data-chat-input
@@ -1570,7 +1828,7 @@ export function InputBar() {
               {t('input.stopping')}
             </span>
           )}
-          {!input && !activePrefix && !isRunning && (
+          {!input && !activePrefixes.length && !isRunning && (
             <span className="flex-shrink-0 text-[10px] text-text-tertiary/50
               group-focus-within/input:hidden select-none whitespace-nowrap
               self-center mr-1">
@@ -1613,7 +1871,7 @@ export function InputBar() {
           <button
             data-testid="send-button"
             onClick={handleSubmit}
-            disabled={isAwaiting || isStopping || (!input.trim() && !activePrefix)}
+            disabled={isAwaiting || isStopping || (!input.trim() && !activePrefixes.length)}
             className={`flex-shrink-0 self-end w-8 h-8 rounded-[10px]
               flex items-center justify-center transition-smooth
               disabled:opacity-30 disabled:cursor-not-allowed
@@ -1632,8 +1890,30 @@ export function InputBar() {
           </div>
         </div>
 
-        {/* Tool row: upload, mode, model */}
+        {/* Tool row: skill, upload, mode, model */}
         <div className="flex items-center gap-2 mt-2">
+          {/* Add skill */}
+          <div ref={skillPickerRef} className="relative">
+            <button
+              onClick={() => setSkillPickerVisible((v) => !v)}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg text-text-tertiary
+                hover:text-text-primary hover:bg-bg-secondary transition-smooth"
+              title={t('input.addSkillTitle')}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"
+                className="text-accent flex-shrink-0">
+                <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+              </svg>
+              <span className="text-[10px] font-medium">{t('input.addSkill')}</span>
+            </button>
+            {skillPickerVisible && (
+              <SkillPicker
+                onSelect={handleSkillPick}
+                onClose={() => setSkillPickerVisible(false)}
+              />
+            )}
+          </div>
+
           {/* Upload button */}
           <button
             onClick={() => fileInputRef.current?.click()}
@@ -1655,8 +1935,38 @@ export function InputBar() {
             onChange={handleFileSelect}
           />
 
-          {/* Mode selector — hidden, use /ask /plan /code /bypass slash commands */}
-          {/* <ModeSelector disabled={isRunning} /> */}
+          {/* Open project folder / in VS Code */}
+          <button
+            onClick={() => {
+              const d = useSettingsStore.getState().workingDirectory;
+              if (d) bridge.openWithDefaultApp(d).catch(() => {});
+            }}
+            className="p-1.5 rounded-lg text-text-tertiary
+              hover:text-text-primary hover:bg-bg-secondary transition-smooth"
+            title={t('input.openProjectFolder')}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5">
+              <path d="M1.5 4A1.5 1.5 0 013 2.5h3l1.5 2H13A1.5 1.5 0 0114.5 6v6A1.5 1.5 0 0113 13.5H3A1.5 1.5 0 011.5 12V4z" />
+            </svg>
+          </button>
+          <button
+            onClick={() => {
+              const d = useSettingsStore.getState().workingDirectory;
+              if (d) bridge.openInVscode(d).catch(() => {});
+            }}
+            className="p-1.5 rounded-lg text-text-tertiary
+              hover:text-text-primary hover:bg-bg-secondary transition-smooth"
+            title={t('input.openProjectInVscode')}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 3L3 3v10h10v-3M9 3h4v4M13 3L7 9" />
+            </svg>
+          </button>
+
+          {/* Mode selector */}
+          <ModeSelector disabled={isRunning} />
 
           {/* Think toggle */}
           <ThinkLevelSelector disabled={isRunning} />
@@ -1686,6 +1996,9 @@ export function InputBar() {
 
           {/* Spacer */}
           <div className="flex-1" />
+
+          {/* Context-window fullness meter (VSCode parity) */}
+          <ContextMeter />
 
           {/* Plan view button */}
           <PlanToggleButton />

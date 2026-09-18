@@ -26,8 +26,9 @@ import { FileChipView } from './FileChipView';
 export interface TiptapEditorHandle {
   /** Extract plain text for submission. FileChips become `path` */
   getText(): string;
-  /** Replace editor content with plain text (used by setInput) */
-  setText(text: string): void;
+  /** Replace editor content with plain text (used by setInput).
+   *  `cursor` controls where the caret ends up: 'end' (default) or 'start'. */
+  setText(text: string, cursor?: 'start' | 'end'): void;
   /** Focus the editor */
   focus(): void;
   /** Insert a file chip at the current cursor position */
@@ -231,7 +232,7 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
         }
         return editorToPlainText(editor);
       },
-      setText(text: string) {
+      setText(text: string, cursor: 'start' | 'end' = 'end') {
         if (!editor) return;
         if (!text) {
           editor.commands.clearContent();
@@ -244,6 +245,12 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
             content: line ? [{ type: 'text', text: line }] : [],
           })),
         );
+        // setContent leaves the caret at the end. Move it to the start when asked
+        // (history recall) so a caret on the last line of a multi-line entry isn't
+        // mistaken for "on a later line" by isCaretOnFirstLine.
+        if (cursor === 'start') {
+          editor.commands.setTextSelection(1);
+        }
       },
       focus() {
         editor?.commands.focus();

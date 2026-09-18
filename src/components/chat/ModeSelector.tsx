@@ -6,16 +6,6 @@ import { useT } from '../../lib/i18n';
 
 const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
   {
-    id: 'code',
-    labelKey: 'mode.code',
-    icon: (
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
-        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-        <path d="M5 4L1 8l4 4M11 4l4 4-4 4" />
-      </svg>
-    ),
-  },
-  {
     id: 'ask',
     labelKey: 'mode.ask',
     icon: (
@@ -37,12 +27,23 @@ const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
     ),
   },
   {
-    id: 'bypass',
-    labelKey: 'mode.bypass',
+    id: 'editAuto',
+    labelKey: 'mode.editAuto',
     icon: (
       <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
         stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M8 2l1.5 4H14l-3.5 2.5L12 13 8 10l-4 3 1.5-4.5L2 6h4.5L8 2z" />
+        <path d="M11.5 2.5l2 2L6 12H4v-2l7.5-7.5z" />
+        <path d="M2.5 13.5l.8-3" />
+      </svg>
+    ),
+  },
+  {
+    id: 'auto',
+    labelKey: 'mode.auto',
+    icon: (
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <path d="M5 4L1 8l4 4M11 4l4 4-4 4" />
       </svg>
     ),
   },
@@ -66,13 +67,13 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
   }, [open]);
 
   const current = MODES.find((m) => m.id === sessionMode) || MODES[0];
-  const isBypass = sessionMode === 'bypass';
+  const isAuto = sessionMode === 'auto';
 
   const MODE_FEEDBACK: Record<SessionMode, { i18nKey: string; icon: string }> = {
-    code: { i18nKey: 'cmd.switchedToCode', icon: '⚡' },
+    auto: { i18nKey: 'cmd.switchedToAuto', icon: '⚡' },
     ask: { i18nKey: 'cmd.switchedToAsk', icon: '💬' },
     plan: { i18nKey: 'cmd.switchedToPlan', icon: '📋' },
-    bypass: { i18nKey: 'cmd.switchedToBypass', icon: '⭐' },
+    editAuto: { i18nKey: 'cmd.switchedToEditAuto', icon: '📝' },
   };
 
   const switchMode = (mode: SessionMode) => {
@@ -100,7 +101,7 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
         onClick={() => setOpen(!open)}
         className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs
           border transition-smooth cursor-pointer
-          ${isBypass
+          ${isAuto
             ? 'border-warning/30 bg-warning/10 text-warning'
             : 'border-border-subtle bg-bg-secondary/50 text-text-muted hover:text-text-primary hover:bg-bg-secondary'
           }`}
@@ -128,7 +129,7 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
                 className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs
                   transition-smooth cursor-pointer
                   ${isActive
-                    ? mode.id === 'bypass'
+                    ? mode.id === 'auto'
                       ? 'bg-warning/10 text-warning font-medium'
                       : 'bg-accent/10 text-accent font-medium'
                     : 'text-text-muted hover:text-text-primary hover:bg-bg-secondary'

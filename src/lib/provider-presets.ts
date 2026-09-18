@@ -29,6 +29,20 @@ export const PROVIDER_PRESETS: PresetProvider[] = [
     thinkingSupport: 'full',
   },
   {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    apiFormat: 'anthropic',
+    extra_env: {},
+    keyUrl: 'https://platform.deepseek.com/api_keys',
+    thinkingSupport: 'unknown',
+    defaultModels: {
+      opus: 'deepseek-v4-pro',
+      sonnet: 'deepseek-v4-flash',
+      haiku: 'deepseek-v4-flash',
+    },
+  },
+  {
     id: 'zhipu',
     name: '智谱 GLM',
     baseUrl: 'https://open.bigmodel.cn/api/anthropic',

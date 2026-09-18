@@ -4,6 +4,7 @@ import { useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatS
 import { MessageBubble } from './MessageBubble';
 import { ToolGroup } from './ToolGroup';
 import { InputBar } from './InputBar';
+import { SessionTabs } from './SessionTabs';
 import { ExportMenu } from '../conversations/ExportMenu';
 import { UpdateButton } from '../shared/UpdateButton';
 import { useSettingsStore, MODEL_OPTIONS, mapSessionModeToPermissionMode } from '../../stores/settingsStore';
@@ -534,7 +535,7 @@ export function ChatPanel() {
 
           {/* Current session mode indicator */}
           <div className={`flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded
-            ${sessionMode === 'bypass'
+            ${sessionMode === 'auto'
               ? 'text-warning/80'
               : 'text-text-tertiary'}`}>
             <span>{t(`mode.${sessionMode}`)}</span>
@@ -568,6 +569,9 @@ export function ChatPanel() {
         </button>
       </div>
 
+      {/* Browser-like tab strip for open sessions */}
+      <SessionTabs />
+
       <div className="flex flex-1 min-h-0 relative">
       {/* Main chat area */}
       <div className="flex flex-col flex-1 min-w-0">
@@ -577,6 +581,7 @@ export function ChatPanel() {
         onScroll={handleScroll}
         data-testid="chat-messages"
         className="flex-1 overflow-y-auto px-5 py-6 selectable"
+        style={{ transform: 'translateZ(0)' }}
       >
         {!workingDirectory && messages.length === 0 && !isStreaming ? (
           <WelcomeScreen />
@@ -587,11 +592,11 @@ export function ChatPanel() {
             {displayItems.map((item, displayIdx) => {
               // Determine spacing based on item type
               const isCompact = item.kind === 'tool_group'
-                || (item.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review'].includes(item.msg.type));
+                || (item.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review', 'cost'].includes(item.msg.type));
               const prevItem = displayIdx > 0 ? displayItems[displayIdx - 1] : null;
               const prevIsCompact = prevItem && (
                 prevItem.kind === 'tool_group'
-                || (prevItem.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review'].includes(prevItem.msg.type))
+                || (prevItem.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review', 'cost'].includes(prevItem.msg.type))
               );
               const spacing = displayIdx === 0
                 ? ''
@@ -820,8 +825,10 @@ async function startDraftSession(folderPath: string) {
   const preWarmId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   try {
     const settings = useSettingsStore.getState();
-    const model = resolveModelForProvider(settings.selectedModel);
     const providerId = useProviderStore.getState().activeProviderId || '';
+    // Native mode (no TOKENICODE-owned provider): leave model undefined so the CLI
+    // reads its shared config (~/.claude/settings.json) and honors CCswitch.
+    const model = providerId ? resolveModelForProvider(settings.selectedModel) : undefined;
     const permissionMode = mapSessionModeToPermissionMode(settings.sessionMode);
 
     // Ensure tab exists before writing sessionMeta

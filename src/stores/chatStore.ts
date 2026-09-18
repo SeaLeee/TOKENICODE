@@ -43,7 +43,7 @@ export interface PermissionRequestData {
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
-  type: 'text' | 'tool_use' | 'thinking' | 'tool_result' | 'permission' | 'plan' | 'plan_review' | 'question' | 'todo';
+  type: 'text' | 'tool_use' | 'thinking' | 'tool_result' | 'permission' | 'plan' | 'plan_review' | 'question' | 'todo' | 'cost';
   content: string;
   toolName?: string;
   toolInput?: any;
@@ -68,6 +68,17 @@ export interface ChatMessage {
   todoItems?: TodoItem[];          // todo list items
   // File attachments (user-sent images/files)
   attachments?: MessageAttachment[];
+  // Skills attached to a user message (slugs) — rendered so the user can see
+  // which skills were sent alongside their prompt.
+  attachedSkills?: string[];
+  // Skills actually invoked by the model (slugs), detected from Skill tool_use
+  // blocks in the stream and rendered on the assistant's reply.
+  usedSkills?: string[];
+  // Per-turn consumption footer (type === 'cost'): token usage for this turn
+  // plus the cumulative session cost reported by the CLI (total_cost_usd).
+  turnInputTokens?: number;
+  turnOutputTokens?: number;
+  costUsd?: number;
   // Command feedback fields (for system messages from slash commands)
   commandType?: 'mode' | 'model-switch' | 'info' | 'help' | 'action' | 'error' | 'processing';
   commandData?: Record<string, any>;
@@ -111,7 +122,7 @@ export interface SessionMeta {
   cwdSnapshot?: string;
   /** Snapshot of config at session spawn time — used for config-mismatch detection */
   configSnapshot?: {
-    model: string;
+    model?: string;
     providerId: string;
     thinkingLevel: string;
     permissionMode: string;
@@ -120,6 +131,9 @@ export interface SessionMeta {
   pendingCommandMsgId?: string;
   /** Accumulated input tokens from stream events (message_start) — per turn, reset each turn */
   inputTokens?: number;
+  /** Latest full-context input tokens (message_start/result) — persists across turns,
+   *  used for the context-fullness meter. Unlike `inputTokens`, never reset per turn. */
+  contextTokens?: number;
   /** Accumulated output tokens from stream events (message_delta) — per turn, reset each turn */
   outputTokens?: number;
   /** Cumulative input tokens across ALL turns in this session/task */
@@ -225,12 +239,16 @@ export interface ActivityStatus {
  */
 export interface PendingUserMessage {
   text: string;
+  /** Full attachment snapshot for queued multimodal turns. */
+  attachments?: FileAttachment[];
   /** spawnConfigHash() snapshot captured when the message was enqueued. */
   enqueueConfigHash?: string;
   /** stdinId of the CLI process the user was talking to at enqueue time. */
   enqueueStdinId?: string;
   /** Timestamp of enqueue (Date.now()). */
   enqueueAt?: number;
+  /** Skill slugs attached to this queued message (surfaced on the user bubble). */
+  attachedSkills?: string[];
 }
 
 export interface SessionSnapshot {
@@ -292,7 +310,7 @@ interface ChatState {
   addPendingMessage: (
     tabId: string,
     text: string,
-    meta?: { enqueueConfigHash?: string; enqueueStdinId?: string },
+    meta?: { enqueueConfigHash?: string; enqueueStdinId?: string; attachedSkills?: string[]; attachments?: FileAttachment[] },
   ) => void;
   /** Dequeue the first pending message (FIFO). Returns undefined if empty. */
   shiftPendingMessage: (tabId: string) => PendingUserMessage | undefined;
@@ -611,9 +629,11 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     set((state) => {
       const item: PendingUserMessage = {
         text,
+        attachments: meta?.attachments,
         enqueueConfigHash: meta?.enqueueConfigHash,
         enqueueStdinId: meta?.enqueueStdinId,
         enqueueAt: Date.now(),
+        attachedSkills: meta?.attachedSkills,
       };
       const result = updateTab(state.tabs, tabId, (tab) => ({
         ...tab,
@@ -670,9 +690,11 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       const nextDraft = [tab.inputDraft, restoredText]
         .filter((item) => item.trim().length > 0)
         .join('\n\n');
+      const restoredAttachments = tab.pendingUserMessages.flatMap((item) => item.attachments ?? []);
       const result = updateTab(state.tabs, tabId, (currentTab) => ({
         ...currentTab,
         inputDraft: nextDraft,
+        pendingAttachments: [...currentTab.pendingAttachments, ...restoredAttachments],
         pendingUserMessages: [],
       }));
       return result ?? {};

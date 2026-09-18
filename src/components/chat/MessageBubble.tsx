@@ -4,6 +4,7 @@ import { useFileStore } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { classifyPathToken, resolvePathToken } from '../../stores/fileReveal';
 import { useLightboxStore } from '../shared/ImageLightbox';
+import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { CommandProcessingCard } from './CommandProcessingCard';
@@ -40,6 +41,7 @@ export const MessageBubble = memo(function MessageBubble({ message, isFirstInGro
   if (message.type === 'tool_use') return <ToolUseMsg message={message} />;
   if (message.type === 'thinking') return <ThinkingMsg message={message} />;
   if (message.type === 'tool_result') return <ToolResultMsg message={message} />;
+  if (message.type === 'cost') return <CostMsg message={message} />;
   // Unresolved permission cards are rendered as floating overlays above InputBar
   if (message.type === 'permission' && !message.resolved && message.interactionState !== 'resolved') return null;
   if (message.type === 'permission') return <PermissionCard message={message} />;
@@ -153,6 +155,25 @@ function UserMsg({ message }: Props) {
       <div className="max-w-[75%] px-3.5 py-2.5 rounded-2xl rounded-br-md
         bg-bg-user-msg text-text-inverse
         text-sm leading-relaxed shadow-md whitespace-pre-wrap">
+        {message.attachedSkills && message.attachedSkills.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 mb-1.5">
+            <span className="text-[10px] text-white/50 uppercase tracking-wider">
+              {t('msg.attachedSkills')}
+            </span>
+            {message.attachedSkills.map((slug) => (
+              <span
+                key={slug}
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md
+                  bg-white/15 border border-white/25 text-[10px] font-mono text-white/90"
+              >
+                <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" className="opacity-70">
+                  <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+                </svg>
+                {slug}
+              </span>
+            ))}
+          </div>
+        )}
         {renderUserContent(displayContent)}
         {!expanded && isLong && (
           <span className="text-white/60">…</span>
@@ -404,6 +425,7 @@ function CommandFeedbackMsg({ message }: Props) {
    AssistantMsg — markdown with avatar (uses shared MarkdownRenderer)
    ================================================================ */
 function AssistantMsg({ message, isFirstInGroup = true }: Props) {
+  const t = useT();
   return (
     <div className="flex gap-3">
       {/* Avatar: show only for the first message in a consecutive group */}
@@ -413,6 +435,25 @@ function AssistantMsg({ message, isFirstInGroup = true }: Props) {
         <div className="w-8 flex-shrink-0" />
       )}
       <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
+        {message.usedSkills && message.usedSkills.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 mb-1.5">
+            <span className="text-[10px] text-text-tertiary uppercase tracking-wider">
+              {t('msg.usedSkills')}
+            </span>
+            {message.usedSkills.map((slug) => (
+              <span
+                key={slug}
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md
+                  bg-accent/10 border border-accent/20 text-[10px] font-mono text-accent"
+              >
+                <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" className="opacity-70">
+                  <path d="M8 1l2.5 5 5.5.8-4 3.9.9 5.3L8 13.3 3.1 16l.9-5.3-4-3.9L5.5 6z" />
+                </svg>
+                {slug}
+              </span>
+            ))}
+          </div>
+        )}
         <MarkdownRenderer content={safeContent(message.content)} />
       </div>
       {/* Right gutter mirrors the avatar so assistant text aligns with the user bubble's right edge */}
@@ -590,6 +631,32 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
             title={input.file_path}
           >
             {shortPath(input.file_path)}
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              bridge.openInVscode(input.file_path).catch(() => {});
+            }}
+            className="p-0.5 rounded text-text-tertiary hover:text-accent transition-smooth"
+            title={t('input.openFile')}
+          >
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 3H3v10h10v-3M9 3h4v4M13 3L7 9" />
+            </svg>
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              bridge.revealInFinder(input.file_path).catch(() => {});
+            }}
+            className="p-0.5 rounded text-text-tertiary hover:text-accent transition-smooth"
+            title={t('input.revealFile')}
+          >
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5">
+              <path d="M1.5 4A1.5 1.5 0 013 2.5h3l1.5 2H13A1.5 1.5 0 0114.5 6v6A1.5 1.5 0 0113 13.5H3A1.5 1.5 0 011.5 12V4z" />
+            </svg>
           </button>
           {/* Diff stats for Edit */}
           {editDiff && (
@@ -1095,6 +1162,43 @@ function TodoMsg({ message }: Props) {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ================================================================
+   CostMsg — gray per-turn consumption footer (tokens + cost)
+   ================================================================ */
+
+/** Format token count: "3.2k" for >=1000, raw number for <1000 */
+function formatTokenCount(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+function CostMsg({ message }: Props) {
+  const t = useT();
+  const inTok = message.turnInputTokens ?? 0;
+  const outTok = message.turnOutputTokens ?? 0;
+  const cost = message.costUsd;
+  return (
+    <div className="flex justify-center my-1 animate-fade-in select-none">
+      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full
+        bg-bg-secondary/50 border border-border-subtle text-[11px] text-text-tertiary
+        font-mono tabular-nums">
+        <span title={t('cmd.costTokens')}>
+          <span className="text-text-tertiary/60">↑</span> {formatTokenCount(inTok)}
+        </span>
+        <span className="text-text-tertiary/40">·</span>
+        <span title={t('cmd.costTokens')}>
+          <span className="text-text-tertiary/60">↓</span> {formatTokenCount(outTok)}
+        </span>
+        {typeof cost === 'number' && (
+          <>
+            <span className="text-text-tertiary/40">·</span>
+            <span title={t('cmd.costAmount')}>${cost.toFixed(4)}</span>
+          </>
+        )}
+      </div>
     </div>
   );
 }

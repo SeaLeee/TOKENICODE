@@ -34,6 +34,23 @@ const COLOR_THEMES: { id: ColorTheme; labelKey: string; preview: string; preview
   },
 ];
 
+/* Small pill toggle switch for boolean settings */
+function ToggleSwitch({ checked, onToggle }: { checked: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      role="switch"
+      aria-checked={checked}
+      className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full
+        transition-smooth cursor-pointer
+        ${checked ? 'bg-accent' : 'bg-border-subtle'}`}
+    >
+      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-smooth
+        ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
+    </button>
+  );
+}
+
 /* Mini app preview — simplified chat interface thumbnail */
 function ThemePreview({ color }: { color: string }) {
   return (
@@ -301,6 +318,47 @@ export function GeneralTab() {
                 {model.label}
               </button>
             ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Skill suggestions */}
+      <div>
+        <h3 className="text-[13px] font-medium text-text-primary mb-3">{t('settings.skillSuggestTitle')}</h3>
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-[13px] text-text-primary">{t('settings.skillAutoSuggest')}</div>
+              <div className="text-[11px] text-text-tertiary">{t('settings.skillAutoSuggestHint')}</div>
+            </div>
+            <ToggleSwitch
+              checked={useSettingsStore((s) => s.skillAutoSuggest)}
+              onToggle={() => useSettingsStore.getState().toggleSkillAutoSuggest()}
+            />
+          </div>
+          <div className={`flex items-center justify-between gap-4 ${
+            !useSettingsStore((s) => s.skillAutoSuggest) ? 'opacity-40 pointer-events-none' : ''
+          }`}>
+            <div>
+              <div className="text-[13px] text-text-primary">{t('settings.skillAutoAttach')}</div>
+              <div className="text-[11px] text-text-tertiary">{t('settings.skillAutoAttachHint')}</div>
+            </div>
+            <ToggleSwitch
+              checked={useSettingsStore((s) => s.skillAutoAttach)}
+              onToggle={() => useSettingsStore.getState().toggleSkillAutoAttach()}
+            />
+          </div>
+          <div className={`flex items-center justify-between gap-4 ${
+            !useSettingsStore((s) => s.skillAutoSuggest) ? 'opacity-40 pointer-events-none' : ''
+          }`}>
+            <div>
+              <div className="text-[13px] text-text-primary">{t('settings.skillAiEnhance')}</div>
+              <div className="text-[11px] text-text-tertiary">{t('settings.skillAiEnhanceHint')}</div>
+            </div>
+            <ToggleSwitch
+              checked={useSettingsStore((s) => s.skillAiEnhance)}
+              onToggle={() => useSettingsStore.getState().toggleSkillAiEnhance()}
+            />
           </div>
         </div>
       </div>

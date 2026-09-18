@@ -190,6 +190,9 @@ impl BypassModeMap {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StartSessionParams {
     pub prompt: String,
+    /// Image files attached to the first user turn. The backend encodes these
+    /// as Claude stream-json image content blocks.
+    pub image_paths: Option<Vec<String>>,
     pub cwd: String,
     pub model: Option<String>,
     pub session_id: Option<String>,

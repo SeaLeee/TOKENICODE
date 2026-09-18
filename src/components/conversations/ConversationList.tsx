@@ -257,10 +257,17 @@ export function ConversationList() {
     return result;
   }, [sessions, searchQuery, displayName, archivedSessions]);
 
-  // Group by project
+  // Pinned sessions — shown in a cross-workspace strip at the very top
+  const pinnedItems = useMemo(() =>
+    filtered.filter((s) => pinnedSessions.has(s.id))
+      .sort((a, b) => b.modifiedAt - a.modifiedAt),
+  [filtered, pinnedSessions]);
+
+  // Group by project (pinned sessions are excluded — they render in the top strip)
   const projectGroups = useMemo(() => {
     const map = new Map<string, SessionListItem[]>();
     for (const s of filtered) {
+      if (pinnedSessions.has(s.id)) continue;
       const raw = s.project || s.projectDir;
       const key = normalizeProjectKey(raw);
       if (!map.has(key)) map.set(key, []);
@@ -276,7 +283,7 @@ export function ConversationList() {
       return tb - ta;
     });
     return entries;
-  }, [filtered]);
+  }, [filtered, pinnedSessions]);
 
   // Content-only matches: sessions hit by content search but NOT by metadata filter
   const contentOnlyMatches = useMemo(() => {
@@ -371,7 +378,7 @@ export function ConversationList() {
       if (useSessionStore.getState().selectedSessionId !== sessionId) {
         return;
       }
-      const { messages, agents } = parseSessionMessages(rawMessages);
+      const { messages, agents, lastContextTokens } = parseSessionMessages(rawMessages);
 
       // Apply agents
       for (const agent of agents) {
@@ -390,6 +397,9 @@ export function ConversationList() {
         }
       }
 
+      if (lastContextTokens > 0) {
+        setSessionMeta(sessionId, { contextTokens: lastContextTokens });
+      }
       setSessionStatus(sessionId, 'completed');
     } catch (err) {
       if (useSessionStore.getState().selectedSessionId !== sessionId) return;
@@ -716,6 +726,36 @@ export function ConversationList() {
         <div className="flex items-center justify-center py-6">
           <div className="w-5 h-5 border-2 border-accent/30
             border-t-accent rounded-full animate-spin" />
+        </div>
+      )}
+
+      {/* Pinned strip — cross-workspace, always at the very top */}
+      {pinnedItems.length > 0 && (
+        <div className="mb-1">
+          <div className="flex items-center gap-2 px-3 py-1">
+            <span className="text-[10px] text-text-tertiary font-medium uppercase tracking-wider">
+              {t('conv.pinned')} ({pinnedItems.length})
+            </span>
+            <div className="flex-1 h-px bg-border-subtle" />
+          </div>
+          {pinnedItems.map((session) => (
+            <SessionItem
+              key={session.id}
+              session={session}
+              isSelected={selectedId === session.id}
+              isRunning={runningSessions.has(session.id)}
+              isPinned={true}
+              displayName={displayName(session)}
+              multiSelect={multiSelect}
+              isChecked={selectedIds.has(session.id)}
+              onSelect={handleLoadSession}
+              onContextMenu={handleContextMenu}
+              onRename={handleRename}
+              onToggleCheck={handleToggleCheck}
+              triggerRename={renamingSessionId === session.id}
+              onRenameDone={() => setRenamingSessionId(null)}
+            />
+          ))}
         </div>
       )}
 

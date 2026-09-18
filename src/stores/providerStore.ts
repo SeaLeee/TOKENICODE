@@ -5,6 +5,10 @@ export interface ModelMapping {
   /** Standard tier ('opus'|'sonnet'|'haiku') or a specific model ID for direct mapping */
   tier: string;
   providerModel: string;
+  /** Optional per-model pricing (USD per 1M tokens) — overrides the built-in
+   *  defaults for accurate cost stats on ccswitch-routed / reseller models. */
+  inputPerMtok?: number;
+  outputPerMtok?: number;
 }
 
 export interface ApiProvider {

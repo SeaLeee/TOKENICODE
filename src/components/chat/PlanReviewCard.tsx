@@ -103,12 +103,12 @@ export function PlanReviewCard({ message, floating }: Props) {
       }
     }
 
-    // Switch frontend to Code mode (CLI already exited plan mode after ExitPlanMode allow)
+    // Switch frontend to Auto mode (CLI already exited plan mode after ExitPlanMode allow)
     if (useSettingsStore.getState().sessionMode === 'plan') {
-      setSessionModeLocal('code');
+      setSessionModeLocal('auto');
     }
     if (planTabId) {
-      useChatStore.getState().setSessionMeta(planTabId, { snapshotMode: 'code' });
+      useChatStore.getState().setSessionMeta(planTabId, { snapshotMode: 'auto' });
     }
 
     if (planTabId) {

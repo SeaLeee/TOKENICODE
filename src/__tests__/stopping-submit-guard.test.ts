@@ -29,7 +29,7 @@ describe('stopping submit guard regressions', () => {
 
   it('disables the send button while stopping', () => {
     expect(inputBarSource).toContain(
-      'disabled={isAwaiting || isStopping || (!input.trim() && !activePrefix)}',
+      'disabled={isAwaiting || isStopping || (!input.trim() && !activePrefixes.length)}',
     );
   });
 

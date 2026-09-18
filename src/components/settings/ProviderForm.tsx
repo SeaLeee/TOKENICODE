@@ -98,10 +98,30 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   };
 
   const updateMapping = (tier: string, value: string) => {
+    const existing = mappings.find((m) => m.tier === tier);
     const updated = mappings.filter((m) => m.tier !== tier);
     if (value) {
-      updated.push({ tier, providerModel: value });
+      updated.push({
+        tier,
+        providerModel: value,
+        inputPerMtok: existing?.inputPerMtok,
+        outputPerMtok: existing?.outputPerMtok,
+      });
     }
+    setMappings(updated);
+    autoSave({ modelMappings: updated });
+  };
+
+  const getMappingPricing = (tier: string): { input?: number; output?: number } => {
+    const m = mappings.find((x) => x.tier === tier);
+    return { input: m?.inputPerMtok, output: m?.outputPerMtok };
+  };
+
+  const updateMappingPricing = (tier: string, field: 'inputPerMtok' | 'outputPerMtok', raw: string) => {
+    const trimmed = raw.trim();
+    const num = trimmed === '' ? undefined : Number(trimmed);
+    const value = num != null && Number.isFinite(num) && num >= 0 ? num : undefined;
+    const updated = mappings.map((m) => (m.tier === tier ? { ...m, [field]: value } : m));
     setMappings(updated);
     autoSave({ modelMappings: updated });
   };
@@ -117,7 +137,7 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   /** Update extra model: tier and providerModel are always the same value */
   const updateExtraModel = (oldTier: string, modelName: string) => {
     const updated = mappings.map((m) =>
-      m.tier === oldTier && !FIXED_TIERS.has(m.tier) ? { tier: modelName, providerModel: modelName } : m,
+      m.tier === oldTier && !FIXED_TIERS.has(m.tier) ? { ...m, tier: modelName, providerModel: modelName } : m,
     );
     setMappings(updated);
     autoSave({ modelMappings: updated });
@@ -345,16 +365,36 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
       <div>
         <label className="text-xs text-text-muted mb-1 block">{t('provider.modelMappings')}</label>
         <p className="text-xs text-text-tertiary mb-1.5">{t('provider.modelMappingsHint')}</p>
+        <p className="text-xs text-text-tertiary mb-1.5">{t('provider.pricingHint')}</p>
         <div className="space-y-1.5">
-          {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }) => (
-            <div key={tier} className="flex items-center gap-2">
-              <span className="text-xs text-text-muted w-14 shrink-0">{t(labelKey)}</span>
-              <input className={INPUT_CLASS}
-                value={getMapping(tier)}
-                onChange={(e) => updateMapping(tier, e.target.value)}
-                placeholder={t(placeholderKey)} />
-            </div>
-          ))}
+          {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }) => {
+            const pricing = getMappingPricing(tier);
+            return (
+              <div key={tier} className="flex items-center gap-2">
+                <span className="text-xs text-text-muted w-14 shrink-0">{t(labelKey)}</span>
+                <input className={INPUT_CLASS}
+                  value={getMapping(tier)}
+                  onChange={(e) => updateMapping(tier, e.target.value)}
+                  placeholder={t(placeholderKey)} />
+                <input
+                  className="w-[52px] shrink-0 px-1.5 py-1 text-[11px] bg-bg-chat border border-border-subtle rounded-md text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent font-mono tabular-nums"
+                  inputMode="decimal"
+                  value={pricing.input != null ? String(pricing.input) : ''}
+                  onChange={(e) => updateMappingPricing(tier, 'inputPerMtok', e.target.value)}
+                  placeholder={t('provider.pricingInput')}
+                  title={t('provider.pricingInput')}
+                />
+                <input
+                  className="w-[52px] shrink-0 px-1.5 py-1 text-[11px] bg-bg-chat border border-border-subtle rounded-md text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent font-mono tabular-nums"
+                  inputMode="decimal"
+                  value={pricing.output != null ? String(pricing.output) : ''}
+                  onChange={(e) => updateMappingPricing(tier, 'outputPerMtok', e.target.value)}
+                  placeholder={t('provider.pricingOutput')}
+                  title={t('provider.pricingOutput')}
+                />
+              </div>
+            );
+          })}
           {extraMappings.map((m, i) => (
             <div key={`extra-${i}`} className="flex items-center gap-1.5">
               <input className="flex-1 min-w-0 px-3 py-2 text-[13px] bg-bg-chat border border-border-subtle rounded-lg text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent font-mono"

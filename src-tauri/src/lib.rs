@@ -4049,6 +4049,40 @@ async fn write_file_content(
     std::fs::write(&p, &content).map_err(|e| format!("Cannot write file: {}", e))
 }
 
+/// Decode a base64 data URL and write it as a binary file. Storyboard images
+/// use this instead of browser storage so reopening the Markdown is durable.
+#[tauri::command]
+async fn write_file_base64(
+    path_access: State<'_, PathAccessManager>,
+    path: String,
+    data_url: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    use base64::Engine as _;
+
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
+    let encoded = data_url
+        .split_once(',')
+        .map(|(_, data)| data)
+        .ok_or_else(|| "Invalid base64 data URL".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("Invalid base64 data: {}", e))?;
+    if bytes.len() > 25_000_000 {
+        return Err("Image too large (>25MB)".to_string());
+    }
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {}", e))?;
+    }
+    std::fs::write(&p, bytes).map_err(|e| format!("Cannot write file: {}", e))
+}
+
 #[tauri::command]
 async fn copy_file(
     path_access: State<'_, PathAccessManager>,
@@ -8025,6 +8059,386 @@ async fn set_dock_icon(app: AppHandle, png_base64: String) -> Result<(), String>
     Ok(())
 }
 
+#[tauri::command]
+async fn send_message(
+    stdin_manager: State<'_, StdinManager>,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
+    stdin_manager.send(&session_id, &message).await
+}
+
+#[tauri::command]
+async fn abort_session(
+    state: State<'_, ProcessManager>,
+    stdin_mgr: State<'_, StdinManager>,
+    bypass_modes: State<'_, BypassModeMap>,
+    session_id: String,
+) -> Result<(), String> {
+    kill_session(state, stdin_mgr, bypass_modes, session_id).await
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeClaudeConfig {
+    model: Option<String>,
+    base_url: Option<String>,
+    has_auth: bool,
+}
+
+fn settings_env_str(json: &Value, key: &str) -> Option<String> {
+    json.get("env")?
+        .get(key)?
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[tauri::command]
+fn get_claude_native_config() -> NativeClaudeConfig {
+    let empty = NativeClaudeConfig {
+        model: None,
+        base_url: None,
+        has_auth: false,
+    };
+    let Some(home) = dirs::home_dir() else {
+        return empty;
+    };
+    let Ok(content) = std::fs::read_to_string(home.join(".claude").join("settings.json")) else {
+        return empty;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return empty;
+    };
+
+    NativeClaudeConfig {
+        has_auth: ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+            .iter()
+            .any(|key| settings_env_str(&json, key).is_some()),
+        model: settings_env_str(&json, "ANTHROPIC_MODEL")
+            .or_else(|| settings_env_str(&json, "ANTHROPIC_DEFAULT_SONNET_MODEL"))
+            .or_else(|| settings_env_str(&json, "ANTHROPIC_DEFAULT_OPUS_MODEL"))
+            .or_else(|| settings_env_str(&json, "ANTHROPIC_DEFAULT_HAIKU_MODEL"))
+            .or_else(|| settings_env_str(&json, "ANTHROPIC_DEFAULT_FABLE_MODEL"))
+            .or_else(|| settings_env_str(&json, "ANTHROPIC_DEFAULT_MODEL")),
+        base_url: settings_env_str(&json, "ANTHROPIC_BASE_URL"),
+    }
+}
+
+#[tauri::command]
+async fn resolve_ccswitch_turn_model(
+    message: String,
+    image_paths: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
+    let _ = message;
+    if let Some(ref paths) = image_paths {
+        if !paths.is_empty() {
+            let cfg = get_claude_native_config();
+            if let Some(ref model) = cfg.model {
+                if model.contains("vision")
+                    || model.contains("claude-3")
+                    || model.contains("gemini")
+                    || model.contains("gpt-4")
+                {
+                    return Ok(Some(model.clone()));
+                }
+            }
+            return Ok(Some("deepseek-v4-flash-vision-exp".to_string()));
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+fn get_home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Could not determine home directory".to_string())
+}
+
+#[tauri::command]
+async fn import_custom_skills(path: String) -> Result<Vec<String>, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Err("Home directory not found".to_string());
+    };
+    let target_base = home.join(".claude").join("skills");
+    let src_dir = std::path::Path::new(&path);
+    if !src_dir.exists() {
+        return Err("Source directory does not exist".to_string());
+    }
+
+    let mut imported = Vec::new();
+
+    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+            } else {
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut process_skill_dir = |skill_dir: &std::path::Path| {
+        let skill_file = skill_dir.join("SKILL.md");
+        if skill_file.exists() {
+            if let Some(name) = skill_dir.file_name().and_then(|n| n.to_str()) {
+                let target_dir = target_base.join(name);
+                if copy_dir_all(skill_dir, &target_dir).is_ok() {
+                    imported.push(name.to_string());
+                }
+            }
+        }
+    };
+
+    process_skill_dir(src_dir);
+
+    let claude_skills = src_dir.join(".claude").join("skills");
+    if claude_skills.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&claude_skills) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    process_skill_dir(&entry.path());
+                }
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(src_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.file_name().and_then(|n| n.to_str()) != Some(".claude") {
+                process_skill_dir(&p);
+                if let Ok(sub_entries) = std::fs::read_dir(&p) {
+                    for sub in sub_entries.flatten() {
+                        if sub.path().is_dir() {
+                            process_skill_dir(&sub.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    imported.sort();
+    imported.dedup();
+    Ok(imported)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillHubNamespace {
+    handle: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    #[serde(rename = "canonicalName")]
+    canonical_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillHubPublisher {
+    name: String,
+    verified: bool,
+    #[serde(rename = "certifiedName")]
+    certified_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillHubSkill {
+    slug: String,
+    name: String,
+    namespace: SkillHubNamespace,
+    description: String,
+    description_zh: Option<String>,
+    #[serde(rename = "iconUrl")]
+    icon_url: String,
+    score: f64,
+    downloads: u64,
+    installs: u64,
+    version: String,
+    category: String,
+    source: String,
+    labels: Option<Value>,
+    publisher: SkillHubPublisher,
+    verified: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SkillHubSearchResult {
+    skills: Vec<SkillHubSkill>,
+    total: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InstallSkillResult {
+    slug: String,
+    path: String,
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillHubSearchParams {
+    keyword: Option<String>,
+    page: Option<u32>,
+    #[serde(rename = "pageSize")]
+    page_size: Option<u32>,
+    #[serde(rename = "sortBy")]
+    sort_by: Option<String>,
+}
+
+#[tauri::command]
+async fn search_skillhub(params: SkillHubSearchParams) -> Result<SkillHubSearchResult, String> {
+    let client = reqwest::Client::new();
+    let mut req = client.get("https://skillhub.qq.com/api/v1/skills").query(&[
+        ("page", params.page.unwrap_or(1).to_string()),
+        ("pageSize", params.page_size.unwrap_or(20).to_string()),
+    ]);
+    if let Some(ref kw) = params.keyword {
+        if !kw.is_empty() {
+            req = req.query(&[("keyword", kw)]);
+        }
+    }
+    if let Some(ref sort) = params.sort_by {
+        if !sort.is_empty() {
+            req = req.query(&[("sortBy", sort)]);
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let result: SkillHubSearchResult = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn install_skill(slug: String, namespace: Option<String>) -> Result<InstallSkillResult, String> {
+    let _ = namespace;
+    let Some(home) = dirs::home_dir() else {
+        return Err("Home directory not found".to_string());
+    };
+    let target_dir = home.join(".claude").join("skills").join(&slug);
+    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+
+    let download_url = format!("https://skillhub.qq.com/api/v1/skills/{}/download", slug);
+    let client = reqwest::Client::new();
+    let bytes = client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("Invalid zip archive: {}", e))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("zip entry error: {}", e))?;
+        let name = file.name().to_string();
+        if name.contains("..") {
+            continue;
+        }
+        let outpath = target_dir.join(name);
+        if file.is_dir() {
+            let _ = std::fs::create_dir_all(&outpath);
+        } else {
+            if let Some(p) = outpath.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+            std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let skill_md_path = target_dir.join("SKILL.md");
+    let content = std::fs::read_to_string(&skill_md_path).unwrap_or_default();
+    let (fm, _) = parse_skill_frontmatter(&content);
+
+    Ok(InstallSkillResult {
+        slug: slug.clone(),
+        path: skill_md_path.to_string_lossy().to_string(),
+        name: slug,
+        description: fm.description.unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
+async fn provider_chat(
+    base_url: String,
+    api_format: String,
+    api_key: String,
+    model: String,
+    prompt: String,
+    proxy_url: Option<String>,
+) -> Result<String, String> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(ref proxy) = proxy_url {
+        if !proxy.is_empty() {
+            if let Ok(p) = reqwest::Proxy::all(proxy) {
+                builder = builder.proxy(p);
+            }
+        }
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+
+    let url = if base_url.ends_with("/chat/completions") || base_url.ends_with("/messages") {
+        base_url
+    } else if api_format == "openai" {
+        format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    } else {
+        format!("{}/v1/messages", base_url.trim_end_matches('/'))
+    };
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1000
+    });
+
+    let mut req = client.post(&url).json(&body);
+    if !api_key.is_empty() {
+        if api_format == "openai" {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        } else {
+            req = req
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(format!("API Error ({}): {}", status, text));
+    }
+
+    let json: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if api_format == "openai" {
+        json.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|m| m.get("message"))
+            .and_then(|c| c.get("content"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Invalid OpenAI response format".to_string())
+    } else {
+        json.get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|m| m.get("text"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Invalid Anthropic response format".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -8100,6 +8514,7 @@ pub fn run() {
             read_file_tree,
             read_file_content,
             write_file_content,
+            write_file_base64,
             copy_file,
             rename_file,
             delete_file,
@@ -8162,6 +8577,15 @@ pub fn run() {
             send_control_request,
             commands::feedback::submit_feedback,
             commands::feedback::feedback_is_configured,
+            send_message,
+            abort_session,
+            resolve_ccswitch_turn_model,
+            get_claude_native_config,
+            get_home_dir,
+            import_custom_skills,
+            search_skillhub,
+            install_skill,
+            provider_chat,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
