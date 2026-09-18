@@ -3407,17 +3407,28 @@ fn extract_session_info(path: &std::path::Path) -> (String, String) {
     (preview, cwd)
 }
 
+/// Windows silently strips trailing dots and spaces from a path component, so
+/// probing `…\Temp ` or `…\Temp.` reports the same hit as `…\Temp`. Candidates
+/// like those fall out of a slice ending in an encoded `.` or space and would
+/// shadow the real match, so they are never probed there.
+fn is_unprobeable_candidate(candidate: &str) -> bool {
+    cfg!(windows) && (candidate.ends_with(' ') || candidate.ends_with('.'))
+}
+
 /// Decode project directory name back to readable path.
 ///
-/// Claude CLI encodes paths by replacing `/` with `-`, e.g.:
+/// Claude CLI encodes a project path by collapsing every character that is not
+/// alphanumeric (or a literal `-`) into a single `-`, e.g.:
 ///   /Users/tinyzhuang/Desktop/ppt-maker → -Users-tinyzhuang-Desktop-ppt-maker
+///   C:\Users\admin\AppData\Local\Temp   → C--Users-admin-AppData-Local-Temp
+/// (the Windows drive yields two dashes: one for `:`, one for the separator).
 ///
 /// Simple `.replace('-', '/')` fails when directory names contain hyphens
 /// (e.g. "ppt-maker" becomes "ppt/maker").
 ///
-/// Claude CLI encodes project paths by replacing `/`, `.`, and ` ` (space)
-/// with `-`. This is lossy: "a-b" could mean "a/b", "a.b", "a b", or literal
-/// "a-b". We resolve ambiguity via greedy filesystem probing.
+/// The encoding is lossy: "a-b" could mean "a/b", "a.b", "a b", or literal
+/// "a-b", and anything non-ASCII is lost outright. We resolve the ambiguity via
+/// greedy filesystem probing.
 ///
 /// Strategy: greedily match real filesystem segments from left to right.
 /// At each position, try the longest possible segment first.  For each
@@ -3432,9 +3443,16 @@ fn decode_project_name(encoded: &str) -> String {
         && encoded.as_bytes()[1] == b'-';
 
     let (trimmed, root, sep) = if is_windows_path {
-        // Windows: "C-Users-foo" → root = "C:\", rest = "Users-foo"
+        // Windows: "C--Users-foo" → root = "C:\", rest = "Users-foo"
+        //
+        // The CLI encodes `C:\` as `C--` — one dash for the drive colon, one for
+        // the separator — so skipping the drive leaves a leading dash. Left in,
+        // it splits into a leading empty part which matches the bare root and
+        // makes the result join as `C:\\Users\...` (doubled separator). Single
+        // dash variants exist too, so strip at most one.
         let drive = &encoded[0..1];
-        let rest = &encoded[2..]; // skip "C-"
+        let after_drive = &encoded[2..]; // skip "C-"
+        let rest = after_drive.strip_prefix('-').unwrap_or(after_drive);
         (rest, format!("{}:\\", drive), "\\")
     } else {
         // Unix: "-Users-foo" → root = "/", rest = "Users-foo"
@@ -3471,6 +3489,12 @@ fn decode_project_name(encoded: &str) -> String {
             // Separators to try: hyphen (original name), space, dot
             for join_sep in ["-", " ", "."] {
                 let candidate = slice.join(join_sep);
+                // An empty candidate resolves to the parent directory itself and
+                // would match every time, swallowing the empty part instead of
+                // letting the dot-prefix branch below turn it into `.foo`.
+                if candidate.is_empty() || is_unprobeable_candidate(&candidate) {
+                    continue;
+                }
                 let full_path = format!(
                     "{}{}{}",
                     parent,
@@ -3508,6 +3532,9 @@ fn decode_project_name(encoded: &str) -> String {
                     for join_sep in ["-", " ", "."] {
                         let after = parts[i..j].join(join_sep);
                         let candidate = format!("{}{}", prefix, after);
+                        if is_unprobeable_candidate(&candidate) {
+                            continue;
+                        }
                         let full_path = format!(
                             "{}{}{}",
                             parent,
@@ -8763,20 +8790,25 @@ mod decode_tests {
     use super::decode_project_name;
     use tempfile::TempDir;
 
-    /// Encode a Unix absolute path the way Claude CLI encodes project dirs:
-    /// `/` → `-`, `.` before a path component → empty part (so `/.foo` → `--foo`).
+    /// Encode an absolute path the way Claude CLI encodes project dir names.
+    ///
+    /// Every character that is neither alphanumeric nor a literal `-` collapses
+    /// to a single `-`: path separators, the Windows drive colon, dots and
+    /// spaces alike. Verified against a real `~/.claude/projects` on Windows:
+    ///   `C:\Users\admin\AppData\Local\Temp` -> `C--Users-admin-AppData-Local-Temp`
+    /// (one dash for `:`, one for `\`). The encoding only replaced `/` before, so
+    /// on Windows it returned the raw path untouched and the decoder was never
+    /// fed the input it is specified against.
     fn encode_path(path: &str) -> String {
-        // Replace leading `/` with `-`, then all remaining `/` with `-`.
-        // Dots at the start of a component become empty parts between dashes.
-        let mut encoded = String::new();
-        for ch in path.chars() {
-            if ch == '/' {
-                encoded.push('-');
-            } else {
-                encoded.push(ch);
-            }
-        }
-        encoded
+        path.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -8820,30 +8852,30 @@ mod decode_tests {
         std::fs::create_dir_all(&hidden).unwrap();
 
         let full_path = hidden.to_string_lossy().to_string();
+        // The `.` in `.claude-worktrees` encodes as a dash, so the separator and
+        // the dot together give `--claude-worktrees`.
         let encoded = encode_path(&full_path);
-        // The `.` in `.claude-worktrees` encodes as an empty part → `--claude-worktrees`
-        let encoded = encoded.replacen("-.", "--", 1);
 
         let result = decode_project_name(&encoded);
-        println!("Encoded: {}", encoded);
-        println!("Result:  {}", result);
-        assert!(
-            result.contains(".claude"),
-            "Expected .claude in path, got: {}",
-            result
+        assert_eq!(
+            result, full_path,
+            "Decoder should recover the dot-prefixed dir from: {}",
+            encoded
         );
     }
 
     #[test]
     fn test_space_in_dir_name_with_tempdir() {
-        // Create a dir with a space in its name
+        // The space is kept ASCII deliberately. Non-ASCII encodes to dashes as
+        // well, so a name like `jd 设计` collapses to `jd---` and no decoder can
+        // recover it — the encoding is lossy for anything outside [A-Za-z0-9-].
         let tmp = TempDir::new().unwrap();
-        let spaced = tmp.path().join("jd 设计");
+        let spaced = tmp.path().join("jd design");
         std::fs::create_dir_all(&spaced).unwrap();
 
         let full_path = spaced.to_string_lossy().to_string();
-        // Claude CLI encodes spaces as dashes too (same as `/`)
-        let encoded = encode_path(&full_path).replace(' ', "-");
+        // Claude CLI encodes spaces as dashes too (same as path separators)
+        let encoded = encode_path(&full_path);
 
         let result = decode_project_name(&encoded);
         assert_eq!(
