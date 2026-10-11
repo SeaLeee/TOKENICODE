@@ -257,10 +257,14 @@ const messages: Record<Locale, Record<string, string>> = {
     'cmd.settings': '设置',
 
     // ModeSelector
-    'mode.auto': '自动',
-    'mode.ask': '手动',
-    'mode.plan': '计划',
-    'mode.editAuto': '编辑自动',
+    // Mode names stay English in both locales: they are the CLI's own permission
+    // modes, and the VS Code extension shows them in English too. The wording
+    // below is copied from the extension verbatim so the two read the same.
+    'mode.auto': 'Bypass permissions',
+    'mode.autoMode': 'Auto mode',
+    'mode.ask': 'Ask before editing',
+    'mode.plan': 'Plan Mode',
+    'mode.editAuto': 'Edit automatically',
 
     // Activity status
     'chat.thinking': '思考中...',
@@ -552,7 +556,8 @@ const messages: Record<Locale, Record<string, string>> = {
     // Command feedback
     'cmd.switchedToAsk': '已切换到手动模式（每次操作都需确认）',
     'cmd.switchedToPlan': '已切换到计划模式（规划任务，不直接执行）',
-    'cmd.switchedToAuto': '已切换到自动模式（跳过所有权限检查）',
+    'cmd.switchedToAuto': '已切换到 Bypass permissions（跳过所有权限检查）',
+    'cmd.switchedToAutoMode': '已切换到 Auto mode（CLI 分类器逐个判断工具调用，低风险自动放行、有风险的拦下；分类器请求会计费）',
     'cmd.switchedToEditAuto': '已切换到编辑自动模式（自动接受文件编辑，危险命令仍需确认）',
     'cmd.compacting': '正在压缩上下文...',
     'cmd.noActiveSession': '没有活跃的会话。请先发送一条消息。',
@@ -1110,10 +1115,12 @@ const messages: Record<Locale, Record<string, string>> = {
     'cmd.settings': 'Settings',
 
     // ModeSelector
-    'mode.auto': 'Auto',
-    'mode.ask': 'Manual',
-    'mode.plan': 'Plan',
-    'mode.editAuto': 'Edit Auto',
+    // Verbatim from the VS Code extension.
+    'mode.auto': 'Bypass permissions',
+    'mode.autoMode': 'Auto mode',
+    'mode.ask': 'Ask before editing',
+    'mode.plan': 'Plan Mode',
+    'mode.editAuto': 'Edit automatically',
 
     // Activity status
     'chat.thinking': 'Thinking...',
@@ -1405,7 +1412,8 @@ const messages: Record<Locale, Record<string, string>> = {
     // Command feedback
     'cmd.switchedToAsk': 'Switched to Manual mode (confirm every action)',
     'cmd.switchedToPlan': 'Switched to Plan mode (planning only, no execution)',
-    'cmd.switchedToAuto': 'Switched to Auto mode (skip all permission checks)',
+    'cmd.switchedToAuto': 'Switched to Bypass permissions (skip all permission checks)',
+    'cmd.switchedToAutoMode': 'Switched to Auto mode (the CLI classifier judges each tool call — low-risk ones run, risky ones are blocked; classifier requests are billed)',
     'cmd.switchedToEditAuto': 'Switched to Edit Auto mode (auto-accept file edits, still confirms dangerous commands)',
     'cmd.compacting': 'Compacting context...',
     'cmd.noActiveSession': 'No active session. Send a message first.',

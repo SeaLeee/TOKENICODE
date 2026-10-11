@@ -16,17 +16,27 @@ export type ModelId =
   | 'claude-opus-4-6-1m'
   | 'claude-sonnet-4-6'
   | 'claude-haiku-4-5-20251001';
-export type SessionMode = 'auto' | 'ask' | 'plan' | 'editAuto';
+export type SessionMode = 'auto' | 'ask' | 'plan' | 'editAuto' | 'autoMode';
 /** CLI permission mode for the SDK control protocol */
-export type CliPermissionMode = 'acceptEdits' | 'default' | 'plan' | 'bypassPermissions';
+export type CliPermissionMode =
+  | 'acceptEdits'
+  | 'default'
+  | 'plan'
+  | 'bypassPermissions'
+  | 'auto';
 export type Locale = 'zh' | 'en';
 
 /**
  * Map frontend session mode to CLI permission mode (VSCode Claude Code parity):
- *   'ask'     → 'default'            (Manual — confirm every action)
- *   'plan'    → 'plan'               (Plan only)
- *   'editAuto'→ 'acceptEdits'        (Edit Auto — auto-accept file edits)
- *   'auto'    → 'bypassPermissions'  (Auto — fully automatic, approve everything)
+ *   'ask'     → 'default'            (Ask before editing — confirm every action)
+ *   'plan'    → 'plan'               (Plan Mode — plan only)
+ *   'editAuto'→ 'acceptEdits'        (Edit automatically — auto-accept edits)
+ *   'autoMode'→ 'auto'               (Auto mode — the CLI's own classifier judges
+ *                                     each tool call: low-risk ones run, risky
+ *                                     ones are blocked. Its classifier requests
+ *                                     are billed, and it needs a model that
+ *                                     supports it.)
+ *   'auto'    → 'bypassPermissions'  (Bypass permissions — approve everything)
  */
 export function mapSessionModeToPermissionMode(mode: SessionMode): CliPermissionMode {
   switch (mode) {
@@ -35,6 +45,9 @@ export function mapSessionModeToPermissionMode(mode: SessionMode): CliPermission
     // can_use_tool with zero frontend overhead; AskUserQuestion still reaches
     // the UI (it is a question to the user, not a permission).
     case 'auto': return 'bypassPermissions';
+    // The CLI's classifier mode. Distinct from bypassPermissions: it does not
+    // approve everything, it judges each call.
+    case 'autoMode': return 'auto';
     case 'ask': return 'default';
     case 'plan': return 'plan';
     case 'editAuto': return 'acceptEdits';

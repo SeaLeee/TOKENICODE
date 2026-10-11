@@ -38,6 +38,19 @@ const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
     ),
   },
   {
+    // The CLI's classifier mode — kept separate from `auto` (which is
+    // bypassPermissions) because it does not approve everything: it judges each
+    // tool call. Same list and order as the VS Code extension.
+    id: 'autoMode',
+    labelKey: 'mode.autoMode',
+    icon: (
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M8 2l1.6 3.6L13 7l-3.4 1.4L8 12 6.4 8.4 3 7l3.4-1.4z" />
+      </svg>
+    ),
+  },
+  {
     id: 'auto',
     labelKey: 'mode.auto',
     icon: (
@@ -71,6 +84,7 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
 
   const MODE_FEEDBACK: Record<SessionMode, { i18nKey: string; icon: string }> = {
     auto: { i18nKey: 'cmd.switchedToAuto', icon: '⚡' },
+    autoMode: { i18nKey: 'cmd.switchedToAutoMode', icon: '✨' },
     ask: { i18nKey: 'cmd.switchedToAsk', icon: '💬' },
     plan: { i18nKey: 'cmd.switchedToPlan', icon: '📋' },
     editAuto: { i18nKey: 'cmd.switchedToEditAuto', icon: '📝' },
