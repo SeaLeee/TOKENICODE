@@ -358,6 +358,17 @@ export function ChatPanel() {
     [agents],
   );
   const totalAgentCount = agents.size;
+  const failedAgentCount = useMemo(
+    () => Array.from(agents.values()).filter((a) => a.phase === 'error').length,
+    [agents],
+  );
+  /** Status-dependent entry label, word for word from the VS Code extension's
+   *  agent-map pill: failed / working / idle. */
+  const agentMapTitle = failedAgentCount > 0
+    ? t('agents.mapFailed')
+    : activeAgentCount > 0
+      ? t('agents.mapWorking')
+      : t('agents.mapIdle');
 
   const showPlanPanel = usePlanPanelStore((s) => s.open);
   const closePlanPanel = usePlanPanelStore((s) => s.close);
@@ -508,14 +519,16 @@ export function ChatPanel() {
             className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded-lg
               transition-smooth text-[9px]
               ${agentPanelOpen ? 'bg-accent/10' : 'hover:bg-bg-secondary/50'}`}
-            title={t('agents.toggle')}>
+            title={agentMapTitle}>
             <span className={`w-[6px] h-[6px] rounded-full flex-shrink-0 transition-smooth
-              ${activeAgentCount > 0
-                ? 'bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.5)] animate-pulse-soft'
-                : totalAgentCount > 0
-                  ? 'bg-success'
-                  : 'bg-text-tertiary/30'}`} />
-            <span className={`${activeAgentCount > 0 ? 'text-amber-400' : totalAgentCount > 0 ? 'text-success' : 'text-text-tertiary'}`}>
+              ${failedAgentCount > 0
+                ? 'bg-error'
+                : activeAgentCount > 0
+                  ? 'bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.5)] animate-pulse-soft'
+                  : totalAgentCount > 0
+                    ? 'bg-success'
+                    : 'bg-text-tertiary/30'}`} />
+            <span className={`${failedAgentCount > 0 ? 'text-error' : activeAgentCount > 0 ? 'text-amber-400' : totalAgentCount > 0 ? 'text-success' : 'text-text-tertiary'}`}>
               Agent{totalAgentCount > 1 ? ` (${totalAgentCount})` : ''}
             </span>
           </button>
