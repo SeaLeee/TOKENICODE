@@ -9,8 +9,11 @@ REM - Runs from the script's own directory so it works from any cwd.
 REM - Frees port 1420 first: a previous run can leave its Vite behind (killing
 REM   the app does not kill its beforeDevCommand), and the next start would then
 REM   die with "Port 1420 is already in use".
+REM - Switches the console to UTF-8: under the default code page Vite's
+REM   box-drawing characters render as mojibake.
 
 setlocal
+chcp 65001 >nul
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 set "CARGO_BUILD_JOBS=4"
 cd /d "%~dp0"
