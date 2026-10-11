@@ -1,4 +1,4 @@
-import { type ReactNode, useState, useRef, useEffect } from 'react';
+import { type ReactNode, useState, useRef, useEffect, useMemo } from 'react';
 import { useSettingsStore, type SessionMode } from '../../stores/settingsStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
@@ -66,6 +66,10 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
   const t = useT();
   const sessionMode = useSettingsStore((s) => s.sessionMode);
   const setSessionMode = useSettingsStore((s) => s.setSessionMode);
+  const selectedSessionIdForInit = useSessionStore((s) => s.selectedSessionId);
+  const cliInit = useChatStore((s) =>
+    selectedSessionIdForInit ? s.tabs.get(selectedSessionIdForInit)?.sessionMeta.cliInit : undefined,
+  );
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -90,8 +94,39 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
     editAuto: { i18nKey: 'cmd.switchedToEditAuto', icon: '📝' },
   };
 
+  /**
+   * Whether the CLI says the current model can run Auto mode.
+   *
+   * `initialize.models[].supportsAutoMode` is the CLI's own answer — the same
+   * field the VS Code extension gates on. `undefined` means the CLI did not say
+   * (older build), in which case the mode stays selectable: never hide something
+   * on a guess.
+   */
+  const autoModeSupported = useMemo(() => {
+    const models = (cliInit as { models?: Array<{ value?: string; supportsAutoMode?: boolean }> } | undefined)
+      ?.models;
+    if (!Array.isArray(models) || models.length === 0) return undefined;
+    const current = models.find((m) => m?.value === 'default') ?? models[0];
+    return typeof current?.supportsAutoMode === 'boolean' ? current.supportsAutoMode : undefined;
+  }, [cliInit]);
+
   const switchMode = (mode: SessionMode) => {
     if (mode === sessionMode) return;
+    // Refuse rather than let the CLI reject it later: the classifier mode needs a
+    // model that supports it, and saying so is clearer than a silent failure.
+    if (mode === 'autoMode' && autoModeSupported === false) {
+      const tabIdUnsupported = useSessionStore.getState().selectedSessionId;
+      if (tabIdUnsupported) {
+        useChatStore.getState().addMessage(tabIdUnsupported, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: t('mode.autoModeUnsupported'),
+          timestamp: Date.now(),
+        });
+      }
+      return;
+    }
     setSessionMode(mode);
     const fb = MODE_FEEDBACK[mode];
     const modeTabId = useSessionStore.getState().selectedSessionId;
