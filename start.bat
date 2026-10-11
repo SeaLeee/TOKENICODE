@@ -12,4 +12,12 @@ set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 set "CARGO_BUILD_JOBS=4"
 cd /d "%~dp0"
 
+REM Free the dev-server port first. A previous run can leave its Vite behind —
+REM killing the app does not kill the beforeDevCommand — and the next start then
+REM dies immediately with "Port 1420 is already in use".
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":1420" ^| findstr LISTENING') do (
+  echo [start.bat] freeing port 1420 (pid %%p)
+  taskkill /F /PID %%p >nul 2>&1
+)
+
 call pnpm tauri dev
