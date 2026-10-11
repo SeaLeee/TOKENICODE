@@ -4,6 +4,9 @@ import { create } from 'zustand';
 
 export type AgentPhase = 'spawning' | 'thinking' | 'writing' | 'tool' | 'completed' | 'error';
 
+/** How much of a subagent's transcript to keep, in characters (the tail). */
+const AGENT_OUTPUT_CAP = 8000;
+
 export interface AgentNode {
   id: string;
   parentId: string | null;
@@ -20,6 +23,10 @@ export interface AgentNode {
    *  (`parent_tool_use_id` results) but it used to be dropped — only the phase
    *  was kept — so the detail view had nothing to show. */
   result?: string;
+  /** What the agent said while it ran — the transcript the extension's agent map
+   *  shows as "output". Accumulated once per completed text block, not per
+   *  streamed token, and capped: only the tail matters for reading progress. */
+  output?: string;
 }
 
 interface AgentState {
@@ -30,6 +37,8 @@ interface AgentState {
   upsertAgent: (node: Partial<AgentNode> & { id: string }) => void;
   updatePhase: (id: string, phase: AgentPhase, currentTool?: string) => void;
   completeAgent: (id: string, phase?: AgentPhase, result?: string) => void;
+  /** Append a finished text block to an agent's output (subagents only). */
+  appendOutput: (id: string, text: string) => void;
   completeAll: (phase?: AgentPhase) => void;
   clearAgents: () => void;
   /** Save current agents to cache for a tab */
@@ -63,6 +72,19 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       next.set(id, { ...agent, phase, currentTool });
       set({ agents: next });
     }
+  },
+
+  appendOutput: (id, text) => {
+    const next = new Map(get().agents);
+    const agent = next.get(id);
+    if (!agent || !text) return;
+    const combined = (agent.output ?? '') + (agent.output ? '\n\n' : '') + text;
+    // Keep the tail: a long-running agent's transcript is not worth unbounded memory.
+    const capped = combined.length > AGENT_OUTPUT_CAP
+      ? combined.slice(combined.length - AGENT_OUTPUT_CAP)
+      : combined;
+    next.set(id, { ...agent, output: capped });
+    set({ agents: next });
   },
 
   completeAgent: (id, phase = 'completed', result) => {

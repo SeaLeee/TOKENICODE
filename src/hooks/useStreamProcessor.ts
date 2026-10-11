@@ -2165,6 +2165,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               usedSkills: textUsedSkills && textUsedSkills.length ? [...textUsedSkills] : undefined,
             });
             if (textUsedSkills) usedSkillsByTab.delete(tabId);
+
+            // A subagent's own words, kept per agent for the agent map's detail
+            // view (the extension shows it as the agent's "output"). Appended once
+            // per completed text block rather than per streamed token, so this
+            // costs one store write per block and attributes correctly — the
+            // stream buffer itself is per process and carries no agent identity.
+            if (agentId !== 'main' && block.text) {
+              agentActions.appendOutput(agentId, block.text);
+            }
           } else if (block.type === 'tool_use') {
             // Record skill invocations so the reply can be annotated with which
             // skills were actually used (Part B of the "show skill usage" request).

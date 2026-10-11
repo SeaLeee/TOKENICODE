@@ -167,6 +167,20 @@ function AgentTreeNode({
                 {phaseText}
               </div>
             </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-wider text-text-tertiary">
+                {t('agents.detailOutput')}
+              </div>
+              {agent.output ? (
+                <div className="text-[10px] text-text-muted whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                  {agent.output}
+                </div>
+              ) : (
+                <div className="text-[10px] text-text-tertiary">
+                  {isFinished ? t('agents.noOutput') : t('agents.noOutputYet')}
+                </div>
+              )}
+            </div>
             {agent.result && (
               <div>
                 <div className="text-[9px] uppercase tracking-wider text-text-tertiary">
