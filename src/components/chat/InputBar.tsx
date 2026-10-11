@@ -124,8 +124,29 @@ function ThinkLevelSelector({ disabled = false }: { disabled?: boolean }) {
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
 
+  // Follow the CLI's own list of effort levels for the current model
+  // (`initialize.models[].supportedEffortLevels`) rather than the hardcoded one,
+  // so a model switch cannot offer a level the CLI would reject. `off` always
+  // stays: it disables thinking instead of picking an effort level. Falls back to
+  // the full list when the CLI did not say (older build) — never hide on a guess.
+  const effortSessionId = useSessionStore((s) => s.selectedSessionId);
+  const effortCliInit = useChatStore((s) =>
+    effortSessionId ? s.tabs.get(effortSessionId)?.sessionMeta.cliInit : undefined,
+  );
+  const effortLevels = (() => {
+    const models = (effortCliInit as
+      { models?: Array<{ value?: string; supportedEffortLevels?: string[] }> } | undefined)?.models;
+    if (!Array.isArray(models) || models.length === 0) return THINK_LEVELS;
+    const model = models.find((m) => m?.value === 'default') ?? models[0];
+    const supported = model?.supportedEffortLevels;
+    if (!Array.isArray(supported) || supported.length === 0) return THINK_LEVELS;
+    return THINK_LEVELS.filter((l) => l.id === 'off' || supported.includes(l.id));
+  })();
+
   const isOff = thinkingLevel === 'off';
-  const current = THINK_LEVELS.find((l) => l.id === thinkingLevel) || THINK_LEVELS[3];
+  const current = effortLevels.find((l) => l.id === thinkingLevel)
+    ?? effortLevels.find((l) => l.id === 'high')
+    ?? effortLevels[0];
 
   return (
     <div ref={ref} className={`relative ${disabled ? 'opacity-40 pointer-events-none' : ''}`}>
@@ -156,7 +177,7 @@ function ThinkLevelSelector({ disabled = false }: { disabled?: boolean }) {
         <div className="absolute bottom-full left-0 mb-1 min-w-[140px]
           bg-bg-card border border-border-subtle rounded-lg shadow-lg
           py-1 z-50 animate-fade-in">
-          {THINK_LEVELS.map((level) => {
+          {effortLevels.map((level) => {
             const isActive = level.id === thinkingLevel;
             return (
               <button
