@@ -13,6 +13,13 @@ export interface AgentNode {
   startTime: number;
   endTime?: number;
   isMain: boolean;
+  /** The prompt that spawned this agent (a subagent's Task input). The VS Code
+   *  extension's agent map shows this in an agent's detail view. */
+  prompt?: string;
+  /** What the agent returned when it finished. The stream carried it all along
+   *  (`parent_tool_use_id` results) but it used to be dropped — only the phase
+   *  was kept — so the detail view had nothing to show. */
+  result?: string;
 }
 
 interface AgentState {
@@ -22,7 +29,7 @@ interface AgentState {
 
   upsertAgent: (node: Partial<AgentNode> & { id: string }) => void;
   updatePhase: (id: string, phase: AgentPhase, currentTool?: string) => void;
-  completeAgent: (id: string, phase?: AgentPhase) => void;
+  completeAgent: (id: string, phase?: AgentPhase, result?: string) => void;
   completeAll: (phase?: AgentPhase) => void;
   clearAgents: () => void;
   /** Save current agents to cache for a tab */
@@ -58,11 +65,17 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     }
   },
 
-  completeAgent: (id, phase = 'completed') => {
+  completeAgent: (id, phase = 'completed', result) => {
     const next = new Map(get().agents);
     const agent = next.get(id);
     if (agent && agent.phase !== 'completed' && agent.phase !== 'error') {
-      next.set(id, { ...agent, phase, endTime: Date.now(), currentTool: undefined });
+      next.set(id, {
+        ...agent,
+        phase,
+        endTime: Date.now(),
+        currentTool: undefined,
+        ...(result ? { result } : {}),
+      });
       set({ agents: next });
     }
   },

@@ -106,6 +106,9 @@ function AgentTreeNode({
 
   const isFinished = agent.phase === 'completed' || agent.phase === 'error';
   const label = agent.isMain ? t('agents.main') : agent.description;
+  /** Clicking a node reveals its detail — the extension's agent map does the
+   *  same ("click an agent for details"), showing prompt / activity / result. */
+  const [expanded, setExpanded] = useState(false);
 
   // Phase status text
   const phaseText = agent.phase === 'tool' && agent.currentTool
@@ -115,10 +118,14 @@ function AgentTreeNode({
   return (
     <div style={{ paddingLeft: `${depth * 16}px` }}>
       {/* Node content */}
-      <div className={`group flex flex-col gap-0.5 py-1.5 px-2 rounded-lg
-        transition-smooth
+      <div
+        onClick={() => setExpanded((v) => !v)}
+        title={t('agents.clickForDetails')}
+        className={`group flex flex-col gap-0.5 py-1.5 px-2 rounded-lg
+        transition-smooth cursor-pointer
         ${isFinished ? 'opacity-70' : ''}
-        hover:bg-bg-secondary/50`}>
+        ${expanded ? 'bg-bg-secondary/40' : 'hover:bg-bg-secondary/50'}`}
+      >
         {/* Top line: dot + title + elapsed */}
         <div className="flex items-center gap-2 min-w-0">
           <StatusDot phase={agent.phase} />
@@ -137,6 +144,41 @@ function AgentTreeNode({
             {phaseText}
           </span>
         </div>
+
+        {/* Detail — same sections the extension's agent map shows */}
+        {expanded && (
+          <div className="pl-4 pt-1.5 space-y-1.5" onClick={(e) => e.stopPropagation()}>
+            {agent.prompt && (
+              <div>
+                <div className="text-[9px] uppercase tracking-wider text-text-tertiary">
+                  {t('agents.detailPrompt')}
+                </div>
+                <div className="text-[10px] text-text-muted whitespace-pre-wrap break-words max-h-24 overflow-y-auto">
+                  {agent.prompt}
+                </div>
+              </div>
+            )}
+            <div>
+              <div className="text-[9px] uppercase tracking-wider text-text-tertiary">
+                {t('agents.detailActivity')}
+              </div>
+              <div className={`text-[10px] break-words
+                ${agent.phase === 'error' ? 'text-red-400' : 'text-text-muted'}`}>
+                {phaseText}
+              </div>
+            </div>
+            {agent.result && (
+              <div>
+                <div className="text-[9px] uppercase tracking-wider text-text-tertiary">
+                  {t('agents.detailResult')}
+                </div>
+                <div className="text-[10px] text-text-muted whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                  {agent.result}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Children */}

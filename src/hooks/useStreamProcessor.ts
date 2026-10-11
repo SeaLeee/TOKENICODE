@@ -2174,6 +2174,22 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               if (!used.includes(skillSlug)) used.push(skillSlug);
               usedSkillsByTab.set(tabId, used);
             }
+            // A subagent's node is created when its Task/Agent tool_use starts
+            // streaming — with an empty description, because the input has not
+            // arrived yet. This is where the full input shows up, so keep the
+            // prompt and the label for the agent map's detail view.
+            // Guarded on existence: upserting an id that has no node yet would
+            // create one without a phase, which the panel cannot render.
+            if ((block.name === 'Task' || block.name === 'Agent') && block.id
+                && agentActions.agents.has(block.id)) {
+              const input = (block.input ?? {}) as { prompt?: string; description?: string };
+              agentActions.upsertAgent({
+                id: block.id,
+                ...(input.description ? { description: input.description } : {}),
+                ...(input.prompt ? { prompt: input.prompt } : {}),
+              });
+            }
+
             // Auto mode: EnterPlanMode/ExitPlanMode are transparent — CLI handles internally.
             // Don't show tool cards; track ExitPlanMode for auto-restart if CLI exits.
             if (getEffectiveMode(useChatStore.getState().getTab(tabId)?.sessionMeta) === 'auto'
@@ -2522,9 +2538,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // session. Without this guard, the first parallel sub-agent to complete would
         // call setSessionStatus('completed') and freeze the UI mid-run.
         if (msg.parent_tool_use_id) {
+          // Keep what the subagent returned, not just its phase: the agent map's
+          // detail view (VS Code extension parity) shows the agent's result.
           agentActions.completeAgent(
             resolveAgentId(msg.parent_tool_use_id, agentActions.agents),
             msg.subtype === 'success' ? 'completed' : 'error',
+            fgErrorText || undefined,
           );
           break;
         }
