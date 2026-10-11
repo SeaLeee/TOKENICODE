@@ -3,6 +3,7 @@ import { useSettingsStore, type SessionMode } from '../../stores/settingsStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useT } from '../../lib/i18n';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
 
 const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
   {
@@ -71,6 +72,9 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
     selectedSessionIdForInit ? s.tabs.get(selectedSessionIdForInit)?.sessionMeta.cliInit : undefined,
   );
   const [open, setOpen] = useState(false);
+  /** Auto mode's billing notice is pending the user's answer. */
+  const [pendingAutoMode, setPendingAutoMode] = useState(false);
+  const autoModeConfirmedRef = useRef(false);
   const ref = useRef<HTMLDivElement>(null);
 
   // Close on outside click
@@ -114,18 +118,27 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
     if (mode === sessionMode) return;
     // Refuse rather than let the CLI reject it later: the classifier mode needs a
     // model that supports it, and saying so is clearer than a silent failure.
-    if (mode === 'autoMode' && autoModeSupported === false) {
-      const tabIdUnsupported = useSessionStore.getState().selectedSessionId;
-      if (tabIdUnsupported) {
-        useChatStore.getState().addMessage(tabIdUnsupported, {
-          id: generateMessageId(),
-          role: 'system',
-          type: 'text',
-          content: t('mode.autoModeUnsupported'),
-          timestamp: Date.now(),
-        });
+    if (mode === 'autoMode') {
+      if (autoModeSupported === false) {
+        const tabIdUnsupported = useSessionStore.getState().selectedSessionId;
+        if (tabIdUnsupported) {
+          useChatStore.getState().addMessage(tabIdUnsupported, {
+            id: generateMessageId(),
+            role: 'system',
+            type: 'text',
+            content: t('mode.autoModeUnsupported'),
+            timestamp: Date.now(),
+          });
+        }
+        return;
       }
-      return;
+      // Auto mode bills for the CLI's classifier requests, so the extension asks
+      // before switching into it. Once the user has agreed in this run, switching
+      // back and forth does not ask again.
+      if (!autoModeConfirmedRef.current) {
+        setPendingAutoMode(true);
+        return;
+      }
     }
     setSessionMode(mode);
     const fb = MODE_FEEDBACK[mode];
@@ -145,6 +158,19 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
 
   return (
     <div ref={ref} className={`relative ${disabled ? 'opacity-40 pointer-events-none' : ''}`}>
+      {/* Billing notice before entering Auto mode — same words the extension uses. */}
+      <ConfirmDialog
+        open={pendingAutoMode}
+        title={t('mode.autoModeTitle')}
+        message={t('mode.autoModeConfirm')}
+        confirmLabel={t('mode.autoModeContinue')}
+        onConfirm={() => {
+          autoModeConfirmedRef.current = true;
+          setPendingAutoMode(false);
+          switchMode('autoMode');
+        }}
+        onCancel={() => setPendingAutoMode(false)}
+      />
       {/* Trigger button — shows current mode */}
       <button
         onClick={() => setOpen(!open)}
