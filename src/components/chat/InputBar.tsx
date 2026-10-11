@@ -1883,9 +1883,22 @@ export function InputBar() {
                 const sid = getActiveTabState().sessionMeta.stdinId;
                 if (!stopTabId || !sid) return;
 
-                // Use lifecycle teardown — sets 'stopping' state, keeps listeners,
-                // waits for process_exit to do full finalization. The process_exit
-                // handler preserves partial text/thinking as interrupted messages.
+                // Interrupt the turn the CLI is running — the same thing the VS Code
+                // extension does, and the reason its Stop is instant. Tearing the
+                // process down instead (what this used to do) is not immediate: it
+                // waits for the process to exit and finalize, and the next message
+                // has to respawn the CLI and re-read the whole session.
+                //
+                // The flag goes first so the result the interrupt produces is
+                // classified as a user stop rather than a failure.
+                useChatStore.getState().setSessionMeta(stopTabId, { teardownReason: 'stop' });
+                try {
+                  await bridge.interruptSession(sid);
+                  return;
+                } catch (err) {
+                  console.warn('[TOKENICODE] interrupt failed, tearing the session down instead:', err);
+                }
+                // No control channel (or the CLI refused it) → the old path.
                 await teardownSession(sid, stopTabId, 'stop');
               }}
               disabled={isStopping}
