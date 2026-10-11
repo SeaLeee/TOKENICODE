@@ -36,6 +36,10 @@ const THINK_LEVELS: { id: ThinkingLevel; labelKey: string }[] = [
   { id: 'low', labelKey: 'think.low' },
   { id: 'medium', labelKey: 'think.medium' },
   { id: 'high', labelKey: 'think.high' },
+  // The CLI reports `supportedEffortLevels: ["low","medium","high","xhigh","max"]`
+  // for this model — `xhigh` was missing here, so the level the CLI offers could
+  // not be selected at all.
+  { id: 'xhigh', labelKey: 'think.xhigh' },
   { id: 'max', labelKey: 'think.max' },
 ];
 

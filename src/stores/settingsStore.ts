@@ -53,7 +53,7 @@ export function mapSessionModeToPermissionMode(mode: SessionMode): CliPermission
     case 'editAuto': return 'acceptEdits';
   }
 }
-export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'max';
+export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 // --- Model options (display mapping) ---
 
