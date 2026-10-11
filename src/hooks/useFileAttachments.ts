@@ -175,8 +175,22 @@ export function useFileAttachments() {
     const targetTabId = ownerTabId ?? useSessionStore.getState().selectedSessionId;
     setIsProcessing(true);
     try {
+      // Deduplicate by path, both within this call and against what is already
+      // attached. One drop can deliver the same path more than once (the native
+      // drop event fires per item), and the browser-side guard only compares
+      // whole path *sets* inside a 500ms window — so a single drop of one video
+      // produced several identical chips the user had to delete by hand.
+      // Re-dropping a file is meant to be a no-op, so keying on the path is the
+      // right identity here.
+      const attached = targetTabId
+        ? useChatStore.getState().getTab(targetTabId)?.pendingAttachments
+        : files;
+      const known = new Set((attached ?? []).map((f) => f.path));
+      const seen = new Set<string>();
       const newFiles: FileAttachment[] = [];
       for (const filePath of paths) {
+        if (seen.has(filePath) || known.has(filePath)) continue;
+        seen.add(filePath);
         try {
           const name = filePath.split(/[\\/]/).pop() || filePath;
           const mime = guessMime(name);

@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { is1MModel, getAutoCompactThreshold, resolveModelForProvider } from '../lib/api-provider';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { is1MModel, resolveModelForProvider } from '../lib/api-provider';
 import { useProviderStore } from '../stores/providerStore';
+
+const apiProviderSource = readFileSync(
+  resolve(__dirname, '../lib/api-provider.ts'),
+  'utf-8',
+);
 
 vi.hoisted(() => {
   const store = new Map<string, string>();
@@ -37,12 +44,15 @@ describe('model context routing', () => {
     expect(is1MModel('claude-opus-4-6-1m')).toBe(true);
     expect(is1MModel('mimo-v2-pro[1m]')).toBe(true);
     expect(is1MModel('claude-opus-4-6')).toBe(false);
-    expect(getAutoCompactThreshold('claude-fable-5')).toBe(160_000);
-    expect(getAutoCompactThreshold('claude-fable-5-1m')).toBe(800_000);
-    expect(getAutoCompactThreshold('claude-opus-4-8')).toBe(160_000);
-    expect(getAutoCompactThreshold('claude-opus-4-8-1m')).toBe(800_000);
-    expect(getAutoCompactThreshold('claude-opus-4-6-1m')).toBe(800_000);
-    expect(getAutoCompactThreshold('claude-opus-4-6')).toBe(160_000);
+  });
+
+  it('leaves the compaction threshold to the CLI', () => {
+    // TOKENICODE stopped deciding when to compact (2026-10-11). The CLI knows the
+    // real token count and cache boundary and checks between every step, whereas
+    // the outer layer could only approximate it — and that approximation had a
+    // 1M session compacting roughly eight times too often. If a threshold helper
+    // reappears here, so has the layer that caused it.
+    expect(apiProviderSource).not.toContain('export function getAutoCompactThreshold');
   });
 
   it('translates -1m UI ids to the CLI [1m] model name', () => {

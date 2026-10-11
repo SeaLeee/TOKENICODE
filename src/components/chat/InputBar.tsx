@@ -1801,6 +1801,20 @@ export function InputBar() {
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
+          {/* Command-list entrance. The popover is driven by the draft text, so
+              seeding the draft with a slash is the whole implementation — same
+              list, same filtering, same keyboard navigation as typing it. */}
+          <button
+            type="button"
+            onClick={() => { setInputSync('/'); detectSlashCommand('/'); }}
+            title={t('slash.openList')}
+            className="flex-shrink-0 w-6 h-6 rounded-lg bg-bg-tertiary flex items-center
+              justify-center font-mono text-[13px] text-text-tertiary
+              hover:text-text-primary transition-smooth cursor-pointer"
+          >
+            /
+          </button>
+
           {/* Free-text editor (skills/commands attach as chips above, not inline) */}
           <div className="flex-1 flex items-start gap-0 min-w-0">
             <TiptapEditor

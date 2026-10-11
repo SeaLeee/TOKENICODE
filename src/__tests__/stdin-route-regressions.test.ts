@@ -118,8 +118,15 @@ describe('stdin route regressions', () => {
     expect(inputBarSource).toContain('setSessionMeta(spawnOwnerTabId, {');
   });
 
-  it('background auto-compact keeps the tab busy until compact settles', () => {
-    expect(streamProcessorSource).toContain("store.setSessionStatus(tabId, 'running');");
-    expect(streamProcessorSource).toContain("completePendingCommand(tabId, { output: 'Compact timed out' });");
+  it('does not decide compaction at the end of a turn', () => {
+    // Compaction belongs to the CLI: it knows the real token count and cache
+    // boundary, checks between every step, and can recover from an overflow by
+    // compacting and retrying. TOKENICODE's own trigger could only approximate
+    // all three, and fired after the turn had already ended.
+    expect(streamProcessorSource).not.toContain('Auto-compact');
+    expect(streamProcessorSource).not.toContain("sendStdin(compactStdinId, '/compact')");
+    expect(streamProcessorSource).not.toContain('markAutoCompactFired');
+    // Measuring the context is still needed — for the meter and the cost footer.
+    expect(streamProcessorSource).toContain('fullContextTokens');
   });
 });

@@ -17,6 +17,8 @@ if (typeof globalThis.window === 'undefined') {
 const mockStartSession = vi.fn();
 const mockKillSession = vi.fn();
 const mockTrackSession = vi.fn();
+const mockRequestContextUsage = vi.fn();
+const mockRequestInitialize = vi.fn();
 const mockOnClaudeStream = vi.fn();
 const mockOnClaudeStderr = vi.fn();
 const mockOnSessionExit = vi.fn();
@@ -26,6 +28,15 @@ vi.mock('../lib/tauri-bridge', () => ({
     startSession: (...args: any[]) => mockStartSession(...args),
     killSession: (...args: any[]) => mockKillSession(...args),
     trackSession: (...args: any[]) => mockTrackSession(...args),
+    // Returns a promise: spawnSession chains `.catch()` on it.
+    requestContextUsage: (...args: any[]) => {
+      mockRequestContextUsage(...args);
+      return Promise.resolve();
+    },
+    requestInitialize: (...args: any[]) => {
+      mockRequestInitialize(...args);
+      return Promise.resolve();
+    },
   },
   onClaudeStream: (...args: any[]) => mockOnClaudeStream(...args),
   onClaudeStderr: (...args: any[]) => mockOnClaudeStderr(...args),
@@ -191,6 +202,14 @@ describe('spawnSession', () => {
   it('calls bridge.startSession (step 3)', async () => {
     await spawnSession(makeSpawnParams());
     expect(mockStartSession).toHaveBeenCalledOnce();
+  });
+
+  it('asks the CLI for its own context accounting at spawn (step 4a)', async () => {
+    // The CLI answers this before its first turn (measured: buffered immediately,
+    // replied to once it is up), so the meter is accurate on a session that has
+    // not sent anything yet. Waiting for system:init would leave it blank.
+    await spawnSession(makeSpawnParams());
+    expect(mockRequestContextUsage).toHaveBeenCalledWith('desk_123');
   });
 
   it('writes sessionMeta snapshot (step 4)', async () => {

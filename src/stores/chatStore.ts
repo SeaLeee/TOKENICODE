@@ -134,6 +134,16 @@ export interface SessionMeta {
   /** Latest full-context input tokens (message_start/result) — persists across turns,
    *  used for the context-fullness meter. Unlike `inputTokens`, never reset per turn. */
   contextTokens?: number;
+  /** The CLI's own context accounting, as returned by `get_context_usage`
+   *  (`percentage`, `autoCompactThreshold`, `isAutoCompactEnabled`, …). Preferred
+   *  over the derived figures whenever present: the CLI counts exactly, the
+   *  stream only approximates. */
+  cliContext?: Record<string, unknown>;
+  /** The CLI's own capability inventory, from the `initialize` control request:
+   *  `commands`, `agents`, `models`, `current_permission_mode`, `output_style`,
+   *  `fast_mode_state`, … Every one of these is something the VS Code extension
+   *  displays straight from the CLI rather than reimplementing. */
+  cliInit?: Record<string, unknown>;
   /** Accumulated output tokens from stream events (message_delta) — per turn, reset each turn */
   outputTokens?: number;
   /** Cumulative input tokens across ALL turns in this session/task */

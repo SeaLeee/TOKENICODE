@@ -138,13 +138,9 @@ export function is1MModel(modelId?: string): boolean {
     || lower.includes('[1m]');
 }
 
-/**
- * Return the auto-compact token threshold for the given model.
- * 80% of context window: 160K for 200K models, 800K for 1M models.
- */
-export function getAutoCompactThreshold(modelId?: string): number {
-  return is1MModel(modelId) ? 800_000 : 160_000;
-}
+// `getAutoCompactThreshold` was removed (2026-10-11). TOKENICODE no longer
+// decides *when* to compact: the CLI owns compaction, and it knows the real
+// token count and cache boundary rather than approximating them from the stream.
 
 /**
  * Full context size in tokens for a Claude API usage object. The raw

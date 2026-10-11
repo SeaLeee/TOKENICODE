@@ -14,6 +14,14 @@ interface CommandState {
 
   // Actions
   fetchCommands: (cwd?: string) => Promise<void>;
+  /** Absorb the CLI's own command inventory (from the `initialize` control
+   *  request) into the list. The CLI is the authority on which commands exist —
+   *  it reports the user's skills as commands too — so anything it names that the
+   *  filesystem scan did not find gets added, and the popover's existing
+   *  grouping, filtering and prefix handling pick it up unchanged. */
+  mergeCliCommands: (
+    commands: Array<{ name: string; description?: string; argumentHint?: string }>,
+  ) => void;
   addPrefix: (cmd: UnifiedCommand) => void;
   removePrefix: (name: string) => void;
   clearPrefixes: () => void;
@@ -34,6 +42,33 @@ export const useCommandStore = create<CommandState>()((set) => ({
       console.error('[commandStore] fetchCommands failed:', err);
       set({ isLoading: false });
     }
+  },
+
+  mergeCliCommands: (incoming) => {
+    const existing = new Set(useCommandStore.getState().commands.map((c) => c.name.toLowerCase()));
+    const additions: UnifiedCommand[] = [];
+    for (const cmd of incoming) {
+      if (!cmd?.name) continue;
+      const name = cmd.name.startsWith('/') ? cmd.name : `/${cmd.name}`;
+      if (existing.has(name.toLowerCase())) continue;
+      existing.add(name.toLowerCase());
+      // The CLI tags scope inside the description: "… (user)" / "… (project)".
+      const raw = cmd.description ?? '';
+      const scoped = /\((user|project)\)\s*$/.test(raw);
+      additions.push({
+        name,
+        description: raw.replace(/\s*\((user|project)\)\s*$/, ''),
+        source: /\(project\)\s*$/.test(raw) ? 'project' : 'global',
+        // Scoped entries are the user's skills; the rest are the CLI's own
+        // built-ins. Descriptions of the latter have no i18n key here, so the
+        // popover falls back to the CLI's own wording — which is the point.
+        category: scoped ? 'skill' : 'builtin',
+        has_args: Boolean(cmd.argumentHint),
+        immediate: false,
+      });
+    }
+    if (!additions.length) return;
+    set({ commands: [...useCommandStore.getState().commands, ...additions] });
   },
 
   // Attach a command/skill to the next message. Re-selecting the same name is

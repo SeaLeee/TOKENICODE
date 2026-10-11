@@ -560,6 +560,28 @@ export const bridge = {
   interruptSession: (sessionId: string) =>
     invoke<void>('send_control_request', { sessionId, subtype: 'interrupt', payload: {} }),
 
+  /** Ask the CLI for its own context-window accounting.
+   *
+   *  This is how the VS Code extension gets the numbers it displays — it does not
+   *  derive them. The CLI answers with `percentage`, `autoCompactThreshold`,
+   *  `isAutoCompactEnabled` and the per-section breakdown, all computed from its
+   *  own exact token count rather than approximated from the event stream. The
+   *  reply arrives asynchronously on the stream as a `control_response`. */
+  requestContextUsage: (sessionId: string) =>
+    invoke<void>('send_control_request', { sessionId, subtype: 'get_context_usage', payload: {} }),
+
+  /** Ask the CLI for its own capability inventory.
+   *
+   *  One request answers almost every parity question at once — the same call the
+   *  VS Code extension makes. The reply carries `commands` (the slash-command
+   *  list with descriptions and argument hints), `agents` (the subagent types),
+   *  `models`, `current_permission_mode`, `output_style` /
+   *  `available_output_styles`, and `fast_mode_state` /
+   *  `fast_mode_disabled_reason`. Measured: ~0.4s, no API call, and it does not
+   *  need a turn first. */
+  requestInitialize: (sessionId: string) =>
+    invoke<void>('send_control_request', { sessionId, subtype: 'initialize', payload: {} }),
+
   /** Submit user feedback via Feishu webhook (self-built app). */
   submitFeedback: (params: {
     description: string;

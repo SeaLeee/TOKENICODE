@@ -6,7 +6,7 @@ import { useAgentStore, resolveAgentId, getAgentDepth } from '../stores/agentSto
 import { useCommandStore } from '../stores/commandStore';
 import { useFileStore } from '../stores/fileStore';
 import { bridge } from '../lib/tauri-bridge';
-import { envFingerprint, resolveModelForProvider, spawnConfigHash, getAutoCompactThreshold, fullContextTokens } from '../lib/api-provider';
+import { envFingerprint, resolveModelForProvider, spawnConfigHash, fullContextTokens } from '../lib/api-provider';
 import { resolveCostUsd } from '../lib/model-pricing';
 import { buildApiRetryStatus } from '../lib/api-retry';
 import { useProviderStore } from '../stores/providerStore';
@@ -23,8 +23,6 @@ import {
   spawnSession,
   teardownSession,
   waitForStdinCleared,
-  hasAutoCompactFired,
-  markAutoCompactFired,
   getRecentlyFinalizedStdin,
 } from '../lib/sessionLifecycle';
 
@@ -1302,7 +1300,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             turns: msg.num_turns,
             inputTokens: resultInput,
             outputTokens: resultOutput,
-            contextTokens: fullContextTokens(msg.usage),
+            // Not from `result.usage` — see the foreground handler.
             totalInputTokens: (prevMeta?.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (prevMeta?.totalOutputTokens || 0) + (resultOutput - streamedOutput),
             turnStartTime: undefined,
@@ -1410,53 +1408,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
         useSessionStore.getState().fetchSessions();
 
-        // S13 fix: Auto-compact for background tabs (same as foreground)
+        // No background auto-compact either — same reasoning as the foreground
+        // handler: the CLI owns compaction. Refresh its context accounting too.
         {
-          const bgCompactTab = store.getTab(tabId);
-          const bgResultInputTokens = msg.usage?.input_tokens || 0;
-          const bgCompactStdinId = bgCompactTab?.sessionMeta.stdinId;
-          const bgCompactThreshold = getAutoCompactThreshold(bgCompactTab?.sessionMeta.spawnedModel);
-          if (bgResultInputTokens > bgCompactThreshold && !hasAutoCompactFired(tabId) && bgCompactStdinId && msg.subtype === 'success') {
-            markAutoCompactFired(tabId);
-            console.log('[TOKENICODE] Background tab auto-compact triggered:', tabId, 'inputTokens =', bgResultInputTokens);
-            const bgCompactMsgId = generateMessageId();
-            const bgCompactStartedAt = Date.now();
-            store.addMessage(tabId, {
-              id: bgCompactMsgId,
-              role: 'system',
-              type: 'text',
-              content: t('chat.autoCompacting'),
-              commandType: 'processing',
-              commandData: { command: '/compact' },
-              commandStartTime: bgCompactStartedAt,
-              timestamp: Date.now(),
-            });
-            store.setSessionMeta(tabId, { pendingCommandMsgId: bgCompactMsgId });
-            store.setSessionStatus(tabId, 'running');
-            store.setSessionMeta(tabId, {
-              turnStartTime: bgCompactStartedAt,
-              lastProgressAt: bgCompactStartedAt,
-              inputTokens: 0,
-              outputTokens: 0,
-            });
-            store.setActivityStatus(tabId, { phase: 'thinking' });
-            bridge.sendStdin(bgCompactStdinId, '/compact').catch((err) => {
-              console.error('[TOKENICODE] Background tab auto-compact failed:', err);
-              completePendingCommand(tabId, { output: 'Compact failed to start' });
-              if (store.getTab(tabId)?.sessionStatus === 'running') {
-                store.setSessionStatus(tabId, 'error');
-              }
-            });
-            setTimeout(() => {
-              const meta = store.getTab(tabId)?.sessionMeta ?? {};
-              if (meta.pendingCommandMsgId === bgCompactMsgId) {
-                completePendingCommand(tabId, { output: 'Compact timed out' });
-                if (store.getTab(tabId)?.sessionStatus === 'running') {
-                  store.setSessionStatus(tabId, 'idle');
-                }
-              }
-            }, 15_000);
-          }
+          const bgRefreshStdinId = store.getTab(tabId)?.sessionMeta.stdinId;
+          if (bgRefreshStdinId) bridge.requestContextUsage(bgRefreshStdinId).catch(() => { /* older CLI */ });
         }
 
         // AI Title Generation for background tabs (same 3rd-turn logic)
@@ -1539,9 +1495,37 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
         break;
       }
+      case 'control_response': {
+        // Same as the foreground handler: keep the CLI's own numbers/inventory.
+        const payload = msg.response?.response ?? msg.response;
+        if (payload && typeof payload === 'object') {
+          if ('percentage' in payload || 'autoCompactThreshold' in payload) {
+            console.log('[TOKENICODE:bg] CLI context usage:', JSON.stringify(payload));
+            store.setSessionMeta(tabId, { cliContext: payload });
+          }
+          if ('commands' in payload || 'current_permission_mode' in payload) {
+            console.log('[TOKENICODE:bg] CLI initialize:',
+              'commands=' + (Array.isArray(payload.commands) ? payload.commands.length : '?'),
+              'agents=' + (Array.isArray(payload.agents) ? payload.agents.length : '?'),
+              'mode=' + payload.current_permission_mode);
+            store.setSessionMeta(tabId, { cliInit: payload });
+            if (Array.isArray(payload.commands)) {
+              useCommandStore.getState().mergeCliCommands(
+                payload.commands as Array<{ name: string; description?: string; argumentHint?: string }>,
+              );
+            }
+          }
+        }
+        break;
+      }
       case 'system':
         if (msg.subtype === 'init') {
           markStdinReady(tabId, msg.__stdinId, msg.model);
+          if (msg.__stdinId) {
+            bridge.requestContextUsage(msg.__stdinId).catch(() => {
+              /* older CLI without the request */
+            });
+          }
         } else if (msg.subtype === 'error') {
           // FI-3: Surface system errors in background tabs too
           store.addMessage(tabId, {
@@ -2021,9 +2005,46 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
 
+      case 'control_response': {
+        // Replies to the control requests we sent at spawn.
+        const payload = msg.response?.response ?? msg.response;
+        if (payload && typeof payload === 'object') {
+          // get_context_usage: the CLI's own context accounting (exact).
+          if ('percentage' in payload || 'autoCompactThreshold' in payload) {
+            console.log('[TOKENICODE] CLI context usage:', JSON.stringify(payload));
+            setSessionMeta({ cliContext: payload });
+          }
+          // initialize: commands / agents / models / permission mode / fast mode.
+          if ('commands' in payload || 'current_permission_mode' in payload) {
+            console.log('[TOKENICODE] CLI initialize:',
+              'commands=' + (Array.isArray(payload.commands) ? payload.commands.length : '?'),
+              'agents=' + (Array.isArray(payload.agents) ? payload.agents.length : '?'),
+              'models=' + (Array.isArray(payload.models) ? payload.models.length : '?'),
+              'mode=' + payload.current_permission_mode,
+              'fast=' + payload.fast_mode_state);
+            setSessionMeta({ cliInit: payload });
+            // The CLI is the authority on which slash commands exist (it lists
+            // the user's skills too), so fold its inventory into the popover's
+            // list rather than maintaining a second, drifting one here.
+            if (Array.isArray(payload.commands)) {
+              useCommandStore.getState().mergeCliCommands(
+                payload.commands as Array<{ name: string; description?: string; argumentHint?: string }>,
+              );
+            }
+          }
+        }
+        break;
+      }
       case 'system':
         if (msg.subtype === 'init') {
           markStdinReady(tabId, msg.__stdinId, msg.model);
+          // Ask the CLI for its own context accounting — what the VS Code
+          // extension displays — rather than deriving it from the stream.
+          if (msg.__stdinId) {
+            bridge.requestContextUsage(msg.__stdinId).catch(() => {
+              /* older CLI without the request; the derived meter still works */
+            });
+          }
         } else if (msg.subtype === 'error') {
           // FI-3: Surface system-level errors instead of silently dropping them
           const rawError = msg.message || msg.error || 'System error';
@@ -2838,7 +2859,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             turns: msg.num_turns,
             inputTokens: resultInput,
             outputTokens: resultOutput,
-            contextTokens: fullContextTokens(msg.usage),
+            // `contextTokens` is NOT written from `result.usage`: that figure
+            // aggregates the turn (and the CLI's own result accumulates across
+            // the session), so it reported 34,485,805 for a 300K context and
+            // pinned the meter at 100%. The context size comes from the
+            // per-request `message_start` above.
             totalInputTokens: (meta.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (meta.totalOutputTokens || 0) + (resultOutput - streamedOutput),
             turnStartTime: undefined,
@@ -2894,55 +2919,24 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           }
         }
 
-        // --- Auto-compact: when input tokens exceed 80% of context window,
-        // automatically send /compact to prevent context overflow on the next turn.
-        // Fires at most once per session to avoid infinite loops.
-        // Threshold is model-aware: 160K for 200K models, 800K for 1M models.
-        const resultInputTokens = msg.usage?.input_tokens || 0;
-        const compactStdinId = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
-        const fgCompactThreshold = getAutoCompactThreshold(useChatStore.getState().getTab(tabId)?.sessionMeta.spawnedModel);
-        if (resultInputTokens > fgCompactThreshold && !hasAutoCompactFired(tabId) && compactStdinId && msg.subtype === 'success') {
-          markAutoCompactFired(tabId);
-          console.log('[TOKENICODE] Auto-compact triggered: inputTokens =', resultInputTokens);
-          const compactMsgId = generateMessageId();
-          addMessage({
-            id: compactMsgId,
-            role: 'system',
-            type: 'text',
-            content: t('chat.autoCompacting'),
-            commandType: 'processing',
-            commandData: { command: '/compact' },
-            commandStartTime: Date.now(),
-            commandCompleted: false,
-            timestamp: Date.now(),
-          });
-          // FI-4: Register pendingCommandMsgId so result handler can mark it completed
-          setSessionMeta({ pendingCommandMsgId: compactMsgId });
-          setSessionStatus('running');
-          setActivityStatus({ phase: 'thinking' });
-          bridge.sendStdin(compactStdinId, '/compact').catch((err) => {
-            console.error('[TOKENICODE] Auto-compact failed:', err);
-          });
-          // FI-4: Timeout fallback — if compact doesn't complete within 90s, auto-complete
-          setTimeout(() => {
-            const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
-            if (meta.pendingCommandMsgId === compactMsgId) {
-              useChatStore.getState().updateMessage(tabId, compactMsgId, {
-                commandCompleted: true,
-                commandData: {
-                  ...(useChatStore.getState().getTab(tabId)?.messages ?? []).find((m) => m.id === compactMsgId)?.commandData,
-                  output: 'Compact timed out',
-                  completedAt: Date.now(),
-                },
-              });
-              useChatStore.getState().setSessionMeta(tabId, { pendingCommandMsgId: undefined });
-              if (useChatStore.getState().getTab(tabId)?.sessionStatus === 'running') {
-                useChatStore.getState().setSessionStatus(tabId, 'idle');
-              }
-            }
-          }, 15_000); // Bug C fix (#27): reduced from 90s to 15s
-          break; // Skip pending message flush — compact takes priority
+        // Refresh the CLI's own context accounting. Cheap and local — verified at
+        // ~0.4s with no API call — so the meter tracks the CLI instead of an
+        // approximation of it.
+        {
+          const refreshStdinId = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
+          if (refreshStdinId) bridge.requestContextUsage(refreshStdinId).catch(() => { /* older CLI */ });
         }
+
+        // Compaction is NOT decided here — the CLI owns it.
+        //
+        // TOKENICODE used to watch for a threshold and send `/compact` itself.
+        // That meant re-deriving something the CLI already knows exactly (its own
+        // token count and cache boundary), from a stream that only approximates
+        // it, and it could only ever act *after* a turn had ended. The CLI
+        // compacts on its own schedule, checks between every step, and recovers
+        // from an overflow by compacting and retrying — all of which the VS Code
+        // extension gets by simply not interfering. The user can still compact
+        // deliberately with the context meter, or with `/compact`.
 
         // BATCH drain: combine ALL pending messages into a single user turn
         // and send at once. The user's mental model is "I'm adding more

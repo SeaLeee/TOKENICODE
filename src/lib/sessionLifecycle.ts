@@ -268,6 +268,26 @@ export async function spawnSession(params: SpawnParams): Promise<SpawnResult> {
     // STEP 4: Start CLI process
     const session = await bridge.startSession(sessionParams);
 
+    // STEP 4a: Ask the CLI for its own context accounting.
+    //
+    // Measured against the CLI: a request sent the instant the process exists is
+    // still answered (the CLI buffers stdin and replies once it is up, ~3.6s on a
+    // cold start, ~0.4s afterwards), so no retry is needed. Doing it here — rather
+    // than waiting for `system:init`, which only arrives with the first turn —
+    // means the meter is accurate on a session that has not sent anything yet.
+    // The request is pure local accounting: no API call, no tokens.
+    bridge.requestContextUsage(stdinId).catch(() => {
+      /* older CLI without the request; the derived meter still works */
+    });
+
+    // STEP 4a (cont.): and its capability inventory — the same call the VS Code
+    // extension makes. One reply carries the slash-command list, the subagent
+    // types, the models, the current permission mode, the output styles and the
+    // fast-mode state, so none of those have to be hardcoded here.
+    bridge.requestInitialize(stdinId).catch(() => {
+      /* older CLI without the request */
+    });
+
     // STEP 4b: Set sessionStatus to running. This is critical for switch/plan-approve
     // paths where teardownSession set 'stopped' before we got here. Without this, the
     // tab would appear stopped while the new process is actively running.
@@ -510,8 +530,7 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       store.setSessionMeta(tabId, { pendingCommandMsgId: undefined });
     }
 
-    // 5b. Clear per-tab autoCompact tracking (NEW-B fix)
-    clearAutoCompact(tabId);
+    // 5b. (auto-compact tracking removed — the CLI owns compaction)
 
     // 6. Clear sessionMeta: clear stdinId, KEEP cliResumeId and cwdSnapshot
     store.setSessionMeta(tabId, {
@@ -551,24 +570,9 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
 }
 
 // ---------------------------------------------------------------------------
-// autoCompactFiredMap — per-tab tracking (replaces global ref)
+// Auto-compact tracking was removed here (2026-10-11).
+//
+// It guarded TOKENICODE's own `/compact` trigger, which has been deleted in
+// favour of letting the CLI compact on its own schedule — it knows the real
+// token count and cache boundary, and checks between every step.
 // ---------------------------------------------------------------------------
-
-/** Per-tab auto-compact tracking. Replaces the module-level `autoCompactFiredRef`
- *  in InputBar.tsx to avoid cross-tab pollution. */
-export const autoCompactFiredMap = new Map<string, boolean>();
-
-/** Mark auto-compact as fired for a tab. */
-export function markAutoCompactFired(tabId: string): void {
-  autoCompactFiredMap.set(tabId, true);
-}
-
-/** Check if auto-compact has fired for a tab. */
-export function hasAutoCompactFired(tabId: string): boolean {
-  return autoCompactFiredMap.get(tabId) ?? false;
-}
-
-/** Clear auto-compact tracking for a tab (called on teardown). */
-export function clearAutoCompact(tabId: string): void {
-  autoCompactFiredMap.delete(tabId);
-}

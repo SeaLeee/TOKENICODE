@@ -8318,28 +8318,35 @@ fn get_claude_native_config() -> NativeClaudeConfig {
     }
 }
 
+/// Pick the model for an image turn while inheriting the CLI's own config.
+///
+/// Returns `Some(model)` only when that config already names a vision-capable
+/// model — in which case the live process usually *is* that model, so no switch
+/// happens. It no longer falls back to a hardcoded model id: that switched the
+/// process on every image turn (each switch tears the CLI down and re-reads the
+/// whole session), and the id was a vendor-specific guess that simply fails
+/// wherever that model does not exist. Images now go to the running model, the
+/// way they do in the VS Code extension — if it cannot take them, the endpoint
+/// says so rather than the app silently rebuilding the session.
 #[tauri::command]
 async fn resolve_ccswitch_turn_model(
     message: String,
     image_paths: Option<Vec<String>>,
 ) -> Result<Option<String>, String> {
     let _ = message;
-    if let Some(ref paths) = image_paths {
-        if !paths.is_empty() {
-            let cfg = get_claude_native_config();
-            if let Some(ref model) = cfg.model {
-                if model.contains("vision")
-                    || model.contains("claude-3")
-                    || model.contains("gemini")
-                    || model.contains("gpt-4")
-                {
-                    return Ok(Some(model.clone()));
-                }
-            }
-            return Ok(Some("deepseek-v4-flash-vision-exp".to_string()));
-        }
+    let has_images = image_paths.is_some_and(|paths| !paths.is_empty());
+    if !has_images {
+        return Ok(None);
     }
-    Ok(None)
+    let Some(model) = get_claude_native_config().model else {
+        return Ok(None);
+    };
+    let lower = model.to_lowercase();
+    let looks_vision_capable = lower.contains("vision")
+        || lower.contains("claude-3")
+        || lower.contains("gemini")
+        || lower.contains("gpt-4");
+    Ok(looks_vision_capable.then_some(model))
 }
 
 #[tauri::command]
