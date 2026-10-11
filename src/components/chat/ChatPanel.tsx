@@ -516,9 +516,11 @@ export function ChatPanel() {
         <div className="relative flex items-center gap-3 ml-3">
           {/* Agent status — clickable dot + label → opens AgentPanel */}
           <button onClick={toggleAgentPanel}
-            className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded-lg
-              transition-smooth text-[9px]
-              ${agentPanelOpen ? 'bg-accent/10' : 'hover:bg-bg-secondary/50'}`}
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded-lg border
+              transition-smooth text-[10px] cursor-pointer
+              ${agentPanelOpen
+                ? 'bg-accent/10 border-accent/30'
+                : 'border-border-subtle bg-bg-secondary/40 hover:bg-bg-secondary hover:border-accent/30'}`}
             title={agentMapTitle}>
             <span className={`w-[6px] h-[6px] rounded-full flex-shrink-0 transition-smooth
               ${failedAgentCount > 0
