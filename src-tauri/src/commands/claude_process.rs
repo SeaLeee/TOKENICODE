@@ -187,6 +187,50 @@ impl BypassModeMap {
     }
 }
 
+/// Pending control requests (`set_permission_mode`, `set_model`) awaiting the
+/// CLI's `control_response`, keyed by request_id.
+///
+/// The stdout reader resolves each waiter with the CLI's answer. Without this,
+/// `send_control_request` could only fire-and-forget: a rejected runtime mode
+/// switch (e.g. bypass disabled by settings) would still be reflected in the
+/// UI, leaving the frontend and CLI in different permission modes.
+#[derive(Debug, Default, Clone)]
+pub struct ControlResponseMap {
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>>>,
+}
+
+impl ControlResponseMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a waiter *before* sending the request. Returns the receiver.
+    pub async fn register(
+        &self,
+        request_id: &str,
+    ) -> oneshot::Receiver<Result<serde_json::Value, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .await
+            .insert(request_id.to_string(), tx);
+        rx
+    }
+
+    /// Resolve a pending request. No-op when the id is unknown (timed out or
+    /// already resolved).
+    pub async fn resolve(&self, request_id: &str, result: Result<serde_json::Value, String>) {
+        if let Some(tx) = self.pending.lock().await.remove(request_id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    /// Drop a waiter after a timeout so the map does not leak.
+    pub async fn forget(&self, request_id: &str) {
+        self.pending.lock().await.remove(request_id);
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StartSessionParams {
     pub prompt: String,
@@ -216,4 +260,45 @@ pub struct StartSessionParams {
     /// before resuming. This prevents "invalid thinking signature" 400 errors when switching
     /// to a different model that can't verify the old model's cryptographic signatures.
     pub model_switch: Option<bool>,
+}
+
+#[cfg(test)]
+mod control_response_tests {
+    use super::ControlResponseMap;
+
+    #[tokio::test]
+    async fn resolve_delivers_success_to_the_waiter() {
+        let map = ControlResponseMap::new();
+        let rx = map.register("req-1").await;
+        map.resolve("req-1", Ok(serde_json::json!({ "mode": "bypassPermissions" })))
+            .await;
+        let got = rx.await.expect("waiter should be resolved").expect("success");
+        assert_eq!(got["mode"], "bypassPermissions");
+    }
+
+    #[tokio::test]
+    async fn resolve_delivers_cli_error_to_the_waiter() {
+        let map = ControlResponseMap::new();
+        let rx = map.register("req-2").await;
+        map.resolve("req-2", Err("bypass disabled".to_string())).await;
+        let err = rx.await.expect("waiter should be resolved").unwrap_err();
+        assert_eq!(err, "bypass disabled");
+    }
+
+    #[tokio::test]
+    async fn unknown_request_id_is_a_no_op() {
+        let map = ControlResponseMap::new();
+        // Must not panic when a stale/foreign control_response arrives.
+        map.resolve("missing", Ok(serde_json::Value::Null)).await;
+        map.forget("missing").await;
+    }
+
+    #[tokio::test]
+    async fn forget_drops_the_waiter_after_timeout() {
+        let map = ControlResponseMap::new();
+        let rx = map.register("req-3").await;
+        map.forget("req-3").await;
+        // Sender was dropped, so the receiver observes a closed channel.
+        assert!(rx.await.is_err());
+    }
 }

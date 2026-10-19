@@ -471,20 +471,35 @@ useSettingsStore.subscribe((state, prevState) => {
 
   const cliMode = mapSessionModeToPermissionMode(state.sessionMode);
 
-  // 'auto' maps to bypassPermissions, which is applied at startup via
-  // --dangerously-skip-permissions; it can't be switched to at runtime.
-  if (cliMode === 'bypassPermissions') return;
-
   // Dynamically import to avoid circular deps
   Promise.all([
     import('../lib/tauri-bridge'),
     import('./chatStore'),
-  ]).then(([{ bridge }, { getActiveTabState }]) => {
+    import('./sessionStore'),
+    import('../lib/i18n'),
+  ]).then(([{ bridge }, { getActiveTabState, generateMessageId, useChatStore }, { useSessionStore }, { t }]) => {
     const stdinId = getActiveTabState().sessionMeta.stdinId;
-    if (!stdinId) return; // No active session
+    if (!stdinId) return; // No active session — the mode applies to the next spawn.
 
+    // Every mode is switchable at runtime, including bypassPermissions: the
+    // CLI accepts `set_permission_mode` on a live session. The command now
+    // waits for the CLI's control_response, so a rejection reaches this catch.
     bridge.setPermissionMode(stdinId, cliMode).catch((err: unknown) => {
       console.error('[TOKENICODE] Failed to set permission mode:', err);
+      // Never leave the UI claiming a mode the CLI is not in: revert locally
+      // (without re-sending) and tell the user why the switch failed.
+      setSessionModeLocal(prevState.sessionMode);
+      const tabId = useSessionStore.getState().selectedSessionId;
+      if (tabId) {
+        const detail = err instanceof Error ? err.message : String(err);
+        useChatStore.getState().addMessage(tabId, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: t('mode.switchFailed').replace('{error}', detail),
+          timestamp: Date.now(),
+        });
+      }
     });
   });
 });

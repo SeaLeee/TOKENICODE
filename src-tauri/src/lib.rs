@@ -11,7 +11,8 @@ mod windows_ps;
 use crate::events::emit_to_frontend;
 use crate::path_access::{PathAccessManager, PathCapability};
 use commands::{
-    BypassModeMap, ManagedProcess, ProcessManager, SessionInfo, StartSessionParams, StdinManager,
+    BypassModeMap, ControlResponseMap, ManagedProcess, ProcessManager, SessionInfo,
+    StartSessionParams, StdinManager,
 };
 // protocol module kept for ControlRequest (send_control_request) and tests
 use futures_util::StreamExt;
@@ -1667,6 +1668,7 @@ async fn start_claude_session(
     state: State<'_, ProcessManager>,
     stdin_mgr: State<'_, StdinManager>,
     bypass_modes: State<'_, BypassModeMap>,
+    control_responses: State<'_, ControlResponseMap>,
     path_access: State<'_, PathAccessManager>,
     params: StartSessionParams,
 ) -> Result<SessionInfo, String> {
@@ -2183,6 +2185,7 @@ async fn start_claude_session(
     let state_clone = state.inner().clone();
     let stdin_mgr_clone = stdin_mgr.inner().clone();
     let bypass_modes_clone = bypass_modes.inner().clone();
+    let control_responses_clone = control_responses.inner().clone();
     let bypass_flag = bypass_modes
         .register(&sid, permission_mode == "bypassPermissions")
         .await;
@@ -2243,6 +2246,35 @@ async fn start_claude_session(
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+
+            // Resolve pending runtime control requests (set_permission_mode,
+            // set_model). The CLI answers each control_request with a
+            // control_response — success or error — so the command that sent it
+            // can report the real outcome instead of assuming it worked.
+            if let Some("control_response") = json.get("type").and_then(|v| v.as_str()) {
+                if let Some(response) = json.get("response") {
+                    let request_id = response
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let result = match response.get("subtype").and_then(|v| v.as_str()) {
+                        Some("success") => {
+                            Ok(response.get("response").cloned().unwrap_or(Value::Null))
+                        }
+                        Some("error") => Err(response
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("CLI rejected the control request")
+                            .to_string()),
+                        other => Err(format!(
+                            "Unexpected control response subtype: {:?}",
+                            other
+                        )),
+                    };
+                    control_responses_clone.resolve(&request_id, result).await;
+                }
+            }
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -2763,6 +2795,7 @@ async fn respond_permission(
 async fn send_control_request(
     stdin_mgr: State<'_, StdinManager>,
     bypass_modes: State<'_, BypassModeMap>,
+    control_responses: State<'_, ControlResponseMap>,
     session_id: String,
     subtype: String,
     payload: Value,
@@ -2807,7 +2840,44 @@ async fn send_control_request(
     };
     let json_str = serde_json::to_string(&req)
         .map_err(|e| format!("Failed to serialize control request: {}", e))?;
-    stdin_mgr.send(&session_id, &json_str).await?;
+
+    // Permission/model changes are confirmed by the CLI. Await the matching
+    // control_response so a rejection (e.g. bypassPermissions disabled in the
+    // CLI's settings) surfaces as an error instead of leaving the UI and the
+    // CLI in different modes. Register before sending to avoid a fast reply
+    // racing the waiter.
+    let request_id = req.request_id.clone();
+    let expects_response = matches!(subtype.as_str(), "set_permission_mode" | "set_model");
+    let receiver = if expects_response {
+        Some(control_responses.register(&request_id).await)
+    } else {
+        None
+    };
+
+    if let Err(e) = stdin_mgr.send(&session_id, &json_str).await {
+        control_responses.forget(&request_id).await;
+        return Err(e);
+    }
+
+    if let Some(rx) = receiver {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(e))) => return Err(format!("CLI rejected {}: {}", subtype, e)),
+            Ok(Err(_)) => {
+                return Err(format!(
+                    "CLI closed the control channel before answering {}",
+                    subtype
+                ))
+            }
+            Err(_) => {
+                control_responses.forget(&request_id).await;
+                return Err(format!("Timed out waiting for CLI to confirm {}", subtype));
+            }
+        }
+    }
+
+    // Only flip the bypass flag once the CLI has confirmed the new mode — the
+    // stdout reader uses it to auto-approve can_use_tool requests.
     if let Some(is_bypass) = next_bypass_mode {
         bypass_modes.set_bypass(&session_id, is_bypass).await;
     }
@@ -8705,6 +8775,7 @@ pub fn run() {
         .manage(ProcessManager::new())
         .manage(StdinManager::new())
         .manage(BypassModeMap::new())
+        .manage(ControlResponseMap::new())
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
         .plugin(tauri_plugin_process::init())
